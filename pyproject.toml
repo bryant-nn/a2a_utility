@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "a2a-utility"
+version = "0.1.0"
+description = "Internal A2A protocol library: hexagonal server (serve_as_a2a, DISCOVERY node) + framework-agnostic outbound client."
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = []
+
+[project.optional-dependencies]
+server = [
+    "a2a-sdk",
+    "starlette",
+    "uvicorn",
+    "pydantic",
+    "pydantic-settings",
+    "httpx",
+]
+client = [
+    "httpx",
+]
+
+[tool.setuptools.packages.find]
+include = ["a2a_utility*"]
