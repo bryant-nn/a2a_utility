@@ -1,15 +1,13 @@
-"""serve_as_a2a — the convenience entry domain agents use (AGENT mode).
+"""Composition helpers: build_agent_card / create_app / serve / serve_as_a2a.
 
-Hexagonal composition root for an executor-callback agent server:
-
-    executor ->  ExecutorAgentExecutor (inbound A2A adapter)
-             ->  DefaultRequestHandler + Starlette routes (a2a-sdk transport)
-
-The developer supplies an `executor: (Task, UserContext) -> list[Part]`
-callback (or wraps a legacy handler via handler_to_executor). If `registry_url`
-is given, the server self-registers (POST /register) on startup and re-registers
-every REGISTRY_HEARTBEAT_SECONDS so a coordinator can discover it dynamically.
+A domain agent writes its own AgentExecutor subclass and hands it to create_app
+together with an AgentCard. create_app wires the native a2a request handler +
+routes and injects a2a_utility's ServerCallContextBuilder (for Principal/permission).
+serve_as_a2a is the one-call convenience that also builds the card and runs uvicorn
+with registry self-registration (heartbeat).
 """
+
+from __future__ import annotations
 
 import asyncio
 import contextlib
@@ -18,6 +16,7 @@ from typing import Optional
 
 import httpx
 import uvicorn
+from a2a.server.agent_execution import AgentExecutor
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
 from a2a.server.tasks import InMemoryTaskStore
@@ -29,16 +28,24 @@ from a2a.types import (
 )
 from starlette.applications import Starlette
 
-from .adapters.inbound.chat_agent_executor import ExecutorAgentExecutor
-from .application.ports.inbound.executor_callback import ExecutorCallback
+from .context import A2AUtilityCallContextBuilder
 
-__all__ = ["serve_as_a2a", "build_app", "build_agent_card", "REGISTRY_HEARTBEAT_SECONDS"]
+__all__ = [
+    "build_agent_card",
+    "create_app",
+    "serve",
+    "serve_as_a2a",
+    "REGISTRY_HEARTBEAT_SECONDS",
+]
 
 logger = logging.getLogger(__name__)
 
 REGISTRY_HEARTBEAT_SECONDS = 5.0
 
 
+# --------------------------------------------------------------------------- #
+# Registry self-registration (heartbeat)                                       #
+# --------------------------------------------------------------------------- #
 async def _register_once(client: httpx.AsyncClient, registry_url: str, payload: dict) -> None:
     try:
         resp = await client.post(f"{registry_url}/register", json=payload, timeout=3.0)
@@ -71,6 +78,9 @@ def _make_lifespan(registry_url: Optional[str], payload: dict):
     return lifespan
 
 
+# --------------------------------------------------------------------------- #
+# Card + app composition                                                       #
+# --------------------------------------------------------------------------- #
 def build_agent_card(
     *,
     name: str,
@@ -109,24 +119,33 @@ def build_agent_card(
     )
 
 
-def build_app(
+def create_app(
     *,
+    executor: AgentExecutor,
     agent_card: AgentCard,
-    executor: ExecutorCallback,
     registry_url: Optional[str] = None,
     registration_payload: Optional[dict] = None,
+    rpc_url: str = "/",
 ) -> Starlette:
-    """Wire the hexagonal layers for an executor-callback AGENT server."""
-    agent_executor = ExecutorAgentExecutor(executor)
+    """Wire a domain agent's AgentExecutor into an A2A Starlette app.
 
+    Injects a2a_utility's ServerCallContextBuilder so every request carries a
+    typed Principal reachable via get_principal(context) inside execute().
+    """
     request_handler = DefaultRequestHandler(
-        agent_executor=agent_executor,
+        agent_executor=executor,
         task_store=InMemoryTaskStore(),
         agent_card=agent_card,
     )
 
     routes = create_agent_card_routes(agent_card)
-    routes.extend(create_jsonrpc_routes(request_handler, "/"))
+    routes.extend(
+        create_jsonrpc_routes(
+            request_handler,
+            rpc_url,
+            context_builder=A2AUtilityCallContextBuilder(),
+        )
+    )
 
     return Starlette(
         routes=routes,
@@ -134,30 +153,28 @@ def build_app(
     )
 
 
+def serve(app: Starlette, *, host: str = "127.0.0.1", port: int) -> None:
+    """Blocking: run the app under uvicorn."""
+    uvicorn.run(app, host=host, port=port)
+
+
 def serve_as_a2a(
     *,
+    executor: AgentExecutor,
     name: str,
     description: str,
     skill_id: str,
     skill_name: str,
     skill_description: str,
     examples: list[str],
-    executor: ExecutorCallback,
     host: str = "127.0.0.1",
     port: int,
     registry_url: Optional[str] = None,
 ) -> None:
-    """Blocking call: run an A2A server exposing `executor` as this agent's only skill.
+    """One-call convenience: build the card, create the app, and serve it.
 
-    `executor` is an async `(Task, UserContext) -> list[Part]` callback. To reuse
-    an existing `(text, emit_thought) -> str` handler, wrap it:
-
-        from a2a_utility.server import serve_as_a2a, handler_to_executor
-        serve_as_a2a(..., executor=handler_to_executor(handle))
-
-    If registry_url is given, this also registers {name, description,
-    agent_card_url} with that registry on startup and keeps re-registering
-    (heartbeat) for as long as the process runs.
+    `executor` is a domain-agent-authored AgentExecutor instance. If registry_url
+    is given, self-registers {name, description, agent_card_url} and heartbeats.
     """
     agent_card = build_agent_card(
         name=name,
@@ -169,18 +186,15 @@ def serve_as_a2a(
         host=host,
         port=port,
     )
-
     registration_payload = {
         "name": name,
         "description": description,
         "agent_card_url": f"http://{host}:{port}/.well-known/agent-card.json",
     }
-
-    app = build_app(
-        agent_card=agent_card,
+    app = create_app(
         executor=executor,
+        agent_card=agent_card,
         registry_url=registry_url,
         registration_payload=registration_payload,
     )
-
-    uvicorn.run(app, host=host, port=port)
+    serve(app, host=host, port=port)

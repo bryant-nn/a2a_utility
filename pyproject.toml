@@ -19,7 +19,9 @@ server = [
     "httpx",
 ]
 client = [
+    "a2a-sdk",
     "httpx",
+    "pydantic",
 ]
 
 [tool.setuptools.packages.find]

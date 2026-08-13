@@ -59,8 +59,13 @@ class DiscoveryClient:
         """Asks the DISCOVERY node's own A2A endpoint to rank agents against
         `query` (DiscoveryAgentExecutor -> SearchAgentUseCase.search) and
         returns its answer as text. Empty query text means list-all on the
-        server side, so prefer list_agents() for that case."""
-        return await call_agent(f"{self._registry_url}/a2a/v1/discovery", query)
+        server side, so prefer list_agents() for that case.
+
+        Targets the registry base URL (not /a2a/v1/discovery): the native a2a
+        client resolves the agent card from base_url/.well-known/... and then
+        POSTs to the card's advertised interface url, which the DISCOVERY node
+        serves at "/"."""
+        return await call_agent(self._registry_url, query)
 
     @staticmethod
     def agent_base_url(agent_card_url: str) -> str:

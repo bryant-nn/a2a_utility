@@ -1,33 +1,65 @@
-"""a2a_utility.server — a hexagonal / DDD A2A server package (Executor-Callback model).
+"""a2a_utility.server — a thin typed wrapper over the native a2a-sdk.
+
+Domain agents write their OWN AgentExecutor.execute(context, event_queue) and
+emit results through TypedTaskUpdater (so everything on the EventQueue conforms
+to the ExtendedPart data contract). Permission/identity rides on the native
+RequestContext.call_context via a2a_utility's ServerCallContextBuilder.
 
 Public surface:
-  - serve_as_a2a: run an AGENT server from an executor callback (Task, UserContext) -> list[Part].
-  - handler_to_executor: bridge a legacy (text, emit_thought) -> str handler onto that callback.
-  - run_agent_server / run_discovery_server: start a standalone node by function call
-    (CLI equivalent: `python -m a2a_utility.server.main`).
-  - ServerMode / A2ASettings: mode selection + pydantic settings (env prefix A2A_).
-  - Data Contract: Part, DataType, Task, UserContext, ExecutorCallback, ThoughtEmitter.
+  - Composition:   build_agent_card, create_app, serve, serve_as_a2a
+  - Emit toolkit:  TypedTaskUpdater
+  - Data contract: ExtendedPart, ExtendedArtifact, ExtendedMessage, A2ATaskResult,
+                   ThinkingResponse, SourceReferenceResponse, CustomizedData
+  - Permission:    Principal, get_principal, A2AUtilityCallContextBuilder
+  - Standalone:    run_agent_server, run_discovery_server, ServerMode, A2ASettings
+  - Re-exports:    AgentExecutor, RequestContext, EventQueue (from a2a, for convenience)
 """
 
-from .application.dtos import Task, ThoughtEmitter, UserContext
-from .application.handler_bridge import handler_to_executor
-from .application.ports.inbound.executor_callback import ExecutorCallback
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
+
+from .app import build_agent_card, create_app, serve, serve_as_a2a
 from .config import A2ASettings, ServerMode
-from .domain.models.part import DataType, Part
+from .context import A2AUtilityCallContextBuilder, Principal, get_principal
+from ..types import (
+    A2ATaskResult,
+    CustomizedData,
+    ExtendedArtifact,
+    ExtendedMessage,
+    ExtendedPart,
+    SourceReferenceResponse,
+    ThinkingResponse,
+)
 from .main import run_agent_server, run_discovery_server
-from .server import serve_as_a2a
+from .updater import TypedTaskUpdater
 
 __all__ = [
+    # composition
+    "build_agent_card",
+    "create_app",
+    "serve",
     "serve_as_a2a",
-    "handler_to_executor",
+    # emit toolkit
+    "TypedTaskUpdater",
+    # data contract
+    "ExtendedPart",
+    "ExtendedArtifact",
+    "ExtendedMessage",
+    "A2ATaskResult",
+    "ThinkingResponse",
+    "SourceReferenceResponse",
+    "CustomizedData",
+    # permission
+    "Principal",
+    "get_principal",
+    "A2AUtilityCallContextBuilder",
+    # standalone nodes
     "run_agent_server",
     "run_discovery_server",
     "ServerMode",
     "A2ASettings",
-    "Part",
-    "DataType",
-    "Task",
-    "UserContext",
-    "ExecutorCallback",
-    "ThoughtEmitter",
+    # native re-exports
+    "AgentExecutor",
+    "RequestContext",
+    "EventQueue",
 ]

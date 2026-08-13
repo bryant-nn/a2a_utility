@@ -1,30 +1,31 @@
-"""Outbound A2A client: SendStreamingMessage over JSON-RPC + SSE.
+"""Outbound A2A client — wraps the native a2a.client.
 
-Any coordinator that can await a coroutine (google-adk via a plain async tool,
-LangChain deepagents, a script, a test) can call a domain agent through
-call_agent() without knowing the A2A wire format.
+Any coordinator/script calls a domain agent through call_agent* without touching
+the A2A wire format. Uses the SDK's own client (`create_client(base_url)` →
+`Client.send_message(SendMessageRequest)` yielding `StreamResponse` protos), and
+maps the returned Artifact parts through the shared typed contract
+(`ExtendedPart.from_protobuf`) so the client speaks the same data format as the
+server.
 
-The server (a2a_utility.server, Executor-Callback model) returns its answer as an
-Artifact of Typed Parts — each part tagged with metadata.dataType (text /
-source_reference / thinking_process / file). Two entry points:
+Three entry points:
+  - call_agent_result(...) -> A2ATaskResult   (task_id, status, typed artifacts)
+  - call_agent_parts(...)  -> list[ExtendedPart]
+  - call_agent(...)        -> str              (concatenated text parts = the answer)
 
-  - call_agent(...)       -> str: the concatenated `text`-dataType parts (the
-    answer). Non-text parts are ignored. Back-compatible with callers that just
-    want the answer string.
-  - call_agent_parts(...) -> list[Part]: every Typed Part, for callers that want
-    source references / thinking / files too.
-
-Either way, WORKING status messages are forwarded live through emit_thought as
-they stream in, and the final COMPLETED status carries no message (the server
-omits it so the artifact is unambiguously the answer).
+WORKING status messages are forwarded live to `emit_thought` as they stream.
 """
 
-import json
+from __future__ import annotations
+
 import uuid
-from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 import httpx
+from a2a.client import ClientConfig, create_client
+from a2a.helpers import new_text_part
+from a2a.types import Message, Role, SendMessageRequest, TaskState
+
+from ..types import A2ATaskResult, ExtendedArtifact, ExtendedPart
 
 ThoughtEmitter = Callable[[str], Awaitable[None]]
 
@@ -33,25 +34,67 @@ class A2ACallError(RuntimeError):
     pass
 
 
-@dataclass
-class Part:
-    """A Typed Part as seen by the client (mirror of the server's Data Contract)."""
+def _build_request(text: str) -> SendMessageRequest:
+    return SendMessageRequest(
+        message=Message(
+            message_id=str(uuid.uuid4()),
+            role=Role.ROLE_USER,
+            parts=[new_text_part(text)],
+        )
+    )
 
-    data: Any
-    data_type: str = "text"
-    metadata: dict[str, Any] = field(default_factory=dict)
 
+async def call_agent_result(
+    base_url: str,
+    text: str,
+    *,
+    emit_thought: Optional[ThoughtEmitter] = None,
+    timeout: Optional[float] = None,
+) -> A2ATaskResult:
+    """Send `text` to the A2A agent at base_url; return a typed A2ATaskResult.
 
-def _parse_artifact_parts(wire_parts: list[dict]) -> list[Part]:
-    parts: list[Part] = []
-    for wp in wire_parts:
-        metadata = wp.get("metadata") or {}
-        data_type = metadata.get("dataType", "text")
-        if "text" in wp:
-            parts.append(Part(data=wp["text"], data_type=data_type, metadata=metadata))
-        elif "data" in wp:
-            parts.append(Part(data=wp["data"], data_type=data_type, metadata=metadata))
-    return parts
+    Raises:
+      A2ACallError: the remote task reached TASK_STATE_FAILED.
+    """
+    task_id = ""
+    status = ""
+    artifacts: list[ExtendedArtifact] = []
+
+    async with httpx.AsyncClient(timeout=timeout) as http:
+        client = await create_client(
+            base_url, ClientConfig(streaming=True, httpx_client=http)
+        )
+        try:
+            async for ev in client.send_message(_build_request(text)):
+                if ev.HasField("status_update"):
+                    su = ev.status_update
+                    task_id = su.task_id or task_id
+                    st = su.status
+                    status = TaskState.Name(st.state)
+                    if st.state == TaskState.TASK_STATE_WORKING and st.HasField("message"):
+                        if emit_thought:
+                            for p in st.message.parts:
+                                if p.HasField("text"):
+                                    await emit_thought(p.text)
+                    elif st.state == TaskState.TASK_STATE_FAILED:
+                        detail = "unknown error"
+                        if st.HasField("message") and st.message.parts:
+                            detail = st.message.parts[0].text
+                        raise A2ACallError(f"agent at {base_url} failed: {detail}")
+                elif ev.HasField("artifact_update"):
+                    au = ev.artifact_update
+                    task_id = au.task_id or task_id
+                    artifacts.append(ExtendedArtifact.from_protobuf(au.artifact))
+                elif ev.HasField("task"):
+                    t = ev.task
+                    task_id = t.id or task_id
+                    status = TaskState.Name(t.status.state)
+                    for a in t.artifacts:
+                        artifacts.append(ExtendedArtifact.from_protobuf(a))
+        finally:
+            await client.close()
+
+    return A2ATaskResult(task_id=task_id, status=status, artifacts=artifacts)
 
 
 async def call_agent_parts(
@@ -60,79 +103,9 @@ async def call_agent_parts(
     *,
     emit_thought: Optional[ThoughtEmitter] = None,
     timeout: Optional[float] = None,
-) -> list[Part]:
-    """Send `text` to the A2A agent at base_url; return its Artifact's Typed Parts.
-
-    Args:
-      base_url: the agent's A2A endpoint, e.g. "http://127.0.0.1:9040/".
-      text: the self-contained question/task to send.
-      emit_thought: awaited with each WORKING-status message as it streams in.
-      timeout: httpx timeout in seconds; None waits indefinitely.
-
-    Raises:
-      A2ACallError: the remote task reached TASK_STATE_FAILED.
-      httpx.HTTPError: the request itself failed.
-    """
-    request_body = {
-        "jsonrpc": "2.0",
-        "id": "1",
-        "method": "SendStreamingMessage",
-        "params": {
-            "message": {
-                "messageId": str(uuid.uuid4()),
-                "role": "ROLE_USER",
-                "parts": [{"text": text}],
-            }
-        },
-    }
-    parts: list[Part] = []
-
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        async with client.stream(
-            "POST",
-            base_url,
-            headers={
-                "Content-Type": "application/json",
-                "A2A-Version": "1.0",
-                "Accept": "text/event-stream",
-            },
-            json=request_body,
-        ) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                frame = json.loads(line[len("data:") :].strip())
-                result = frame.get("result")
-                if not result:
-                    continue
-
-                status_update = result.get("statusUpdate")
-                if status_update:
-                    status = status_update.get("status", {})
-                    state = status.get("state")
-                    message = status.get("message")
-                    if state == "TASK_STATE_WORKING" and message:
-                        for part in message.get("parts", []):
-                            if part.get("text") and emit_thought:
-                                await emit_thought(part["text"])
-                    elif state == "TASK_STATE_FAILED":
-                        msg_parts = (message or {}).get("parts", [])
-                        detail = msg_parts[0].get("text") if msg_parts else "unknown error"
-                        raise A2ACallError(f"agent at {base_url} failed: {detail}")
-                    continue
-
-                artifact_update = result.get("artifactUpdate")
-                if artifact_update:
-                    wire_parts = artifact_update.get("artifact", {}).get("parts", [])
-                    parts.extend(_parse_artifact_parts(wire_parts))
-
-    return parts
-
-
-def parts_to_text(parts: list[Part]) -> str:
-    """Concatenate the `text`-dataType parts (the answer)."""
-    return "".join(str(p.data) for p in parts if p.data_type == "text")
+) -> list[ExtendedPart]:
+    result = await call_agent_result(base_url, text, emit_thought=emit_thought, timeout=timeout)
+    return result.parts()
 
 
 async def call_agent(
@@ -142,12 +115,6 @@ async def call_agent(
     emit_thought: Optional[ThoughtEmitter] = None,
     timeout: Optional[float] = None,
 ) -> str:
-    """Send `text` to the A2A agent at base_url and return its final answer text.
-
-    Convenience over call_agent_parts(): returns only the concatenated
-    `text`-dataType parts. Use call_agent_parts() for the full Typed Parts.
-    """
-    parts = await call_agent_parts(
-        base_url, text, emit_thought=emit_thought, timeout=timeout
-    )
-    return parts_to_text(parts)
+    """Convenience: return only the concatenated text parts (the answer)."""
+    result = await call_agent_result(base_url, text, emit_thought=emit_thought, timeout=timeout)
+    return result.text()
