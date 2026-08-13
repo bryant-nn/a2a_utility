@@ -45,18 +45,3 @@ class A2ASettings(BaseSettings):
     @property
     def agent_card_url(self) -> str:
         return f"{self.url}/.well-known/agent-card.json"
-
-
-class LLMSettings(BaseSettings):
-    """OpenAI-compatible LLM settings (env prefix: LLM_).
-
-    Only read in AGENT mode when using the OpenAI outbound adapter; the
-    pluggable HandlerLLMAdapter path (used by the domain agents) ignores this.
-    """
-
-    model_config = SettingsConfigDict(env_prefix="LLM_", extra="ignore")
-
-    base_url: str = "https://api.openai.com/v1"
-    api_key: str = ""
-    model: str = "gpt-4o-mini"
-    system_prompt: str = "You are a helpful assistant."

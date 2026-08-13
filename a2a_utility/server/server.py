@@ -1,16 +1,14 @@
-"""serve_as_a2a — the convenience entry the domain agents use (AGENT mode).
+"""serve_as_a2a — the convenience entry domain agents use (AGENT mode).
 
-This is the hexagonal composition root for a *pluggable-handler* agent server:
+Hexagonal composition root for an executor-callback agent server:
 
-    handler ->  HandlerLLMAdapter (outbound LLM port)
-             -> ChatUseCase       (application)
-             -> ChatAgentExecutor (inbound A2A adapter)
-             -> DefaultRequestHandler + Starlette routes (a2a-sdk transport)
+    executor ->  ExecutorAgentExecutor (inbound A2A adapter)
+             ->  DefaultRequestHandler + Starlette routes (a2a-sdk transport)
 
-It keeps the exact signature the four domain agents already call, so switching
-them onto the new package is a one-line import change. If `registry_url` is
-given, the server self-registers (POST /register) on startup and re-registers
-every REGISTRY_HEARTBEAT_SECONDS, so the coordinator can discover it dynamically.
+The developer supplies an `executor: (Task, UserContext) -> list[Part]`
+callback (or wraps a legacy handler via handler_to_executor). If `registry_url`
+is given, the server self-registers (POST /register) on startup and re-registers
+every REGISTRY_HEARTBEAT_SECONDS so a coordinator can discover it dynamically.
 """
 
 import asyncio
@@ -31,11 +29,10 @@ from a2a.types import (
 )
 from starlette.applications import Starlette
 
-from .adapters.inbound.chat_agent_executor import ChatAgentExecutor
-from .adapters.outbound.handler_llm_adapter import Handler, HandlerLLMAdapter, ThoughtEmitter
-from .application.use_cases.chat_use_case import ChatUseCase
+from .adapters.inbound.chat_agent_executor import ExecutorAgentExecutor
+from .application.ports.inbound.executor_callback import ExecutorCallback
 
-__all__ = ["serve_as_a2a", "Handler", "ThoughtEmitter", "REGISTRY_HEARTBEAT_SECONDS"]
+__all__ = ["serve_as_a2a", "build_app", "build_agent_card", "REGISTRY_HEARTBEAT_SECONDS"]
 
 logger = logging.getLogger(__name__)
 
@@ -115,17 +112,15 @@ def build_agent_card(
 def build_app(
     *,
     agent_card: AgentCard,
-    handler: Handler,
+    executor: ExecutorCallback,
     registry_url: Optional[str] = None,
     registration_payload: Optional[dict] = None,
 ) -> Starlette:
-    """Wire the hexagonal layers for a pluggable-handler AGENT server."""
-    llm_adapter = HandlerLLMAdapter(handler)
-    chat_use_case = ChatUseCase(llm_service=llm_adapter)
-    executor = ChatAgentExecutor(chat_use_case=chat_use_case)
+    """Wire the hexagonal layers for an executor-callback AGENT server."""
+    agent_executor = ExecutorAgentExecutor(executor)
 
     request_handler = DefaultRequestHandler(
-        agent_executor=executor,
+        agent_executor=agent_executor,
         task_store=InMemoryTaskStore(),
         agent_card=agent_card,
     )
@@ -147,15 +142,18 @@ def serve_as_a2a(
     skill_name: str,
     skill_description: str,
     examples: list[str],
-    handler: Handler,
+    executor: ExecutorCallback,
     host: str = "127.0.0.1",
     port: int,
     registry_url: Optional[str] = None,
 ) -> None:
-    """Blocking call: run an A2A server exposing `handler` as this agent's only skill.
+    """Blocking call: run an A2A server exposing `executor` as this agent's only skill.
 
-    `handler` is any async `(text, emit_thought) -> str`; each emit_thought(...)
-    streams a thought, the return value is the final answer.
+    `executor` is an async `(Task, UserContext) -> list[Part]` callback. To reuse
+    an existing `(text, emit_thought) -> str` handler, wrap it:
+
+        from a2a_utility.server import serve_as_a2a, handler_to_executor
+        serve_as_a2a(..., executor=handler_to_executor(handle))
 
     If registry_url is given, this also registers {name, description,
     agent_card_url} with that registry on startup and keeps re-registering
@@ -180,7 +178,7 @@ def serve_as_a2a(
 
     app = build_app(
         agent_card=agent_card,
-        handler=handler,
+        executor=executor,
         registry_url=registry_url,
         registration_payload=registration_payload,
     )

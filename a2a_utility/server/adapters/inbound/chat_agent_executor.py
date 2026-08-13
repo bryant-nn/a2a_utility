@@ -1,70 +1,75 @@
-"""ChatAgentExecutor — A2A inbound adapter for AGENT mode.
+"""ExecutorAgentExecutor — A2A inbound adapter for the Executor-Callback model.
 
-Bridges the A2A protocol to the ChatUseCase: it turns an incoming A2A task into a
-`query`, streams the use case, and maps each StreamChunk back onto A2A events:
+adjust.md §step-3. Flow per request:
 
-  - THINKING chunk -> a WORKING status update carrying the reasoning text, so the
-    coordinator's trace UI can show the sub-agent thinking live.
-  - ANSWER chunks  -> accumulated and emitted as the single final artifact.
+  A2A Request
+    -> normalize to application Task (id, contextId, message text)
+    -> middleware builds a mock UserContext (+ live emit_thought hook)
+    -> call the developer's ExecutorCallback(task, ctx) -> list[Part]
+    -> pack the Typed Parts into ONE Artifact on the Task response, COMPLETED.
 
-Critical ordering note: the final
-answer is delivered as an *artifact*, and NO trailing status message is sent
-after it. google.adk.tools.agent_tool.AgentTool extracts a RemoteA2aAgent's final
-answer by overwriting last_content with whatever event it saw last; a message
-after the artifact (even a generic "done") would silently replace the real answer.
+Live streaming is preserved: the callback (or the handler_to_executor bridge)
+may call ctx.emit_thought(text) during execution, which is mapped to an A2A
+WORKING status message so a coordinator's trace UI shows thinking as it happens.
+
+Critical ordering (unchanged): the final answer rides in the Artifact and NO
+status message is sent after it — google-adk's AgentTool overwrites last_content
+with the last event it sees, so a trailing message would clobber the answer.
+The `text`-dataType Part maps to an a2a text part, which is exactly what
+RemoteA2aAgent reads back as the answer; thinking_process/source_reference/file
+Parts map to data parts and stay out of that text channel.
 """
 
 from a2a.helpers import (
     get_message_text,
     new_task_from_user_message,
     new_text_message,
-    new_text_part,
 )
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
 from a2a.types import TaskState
 
-from ...application.ports.inbound.chat_use_case_port import ChatUseCasePort
-from ...domain.models.chat_message import StreamPhase
+from ...application.dtos import Task
+from ...application.ports.inbound.executor_callback import ExecutorCallback
+from .dtos import ArtifactDTO
+from .middleware import build_user_context
 
 
-class ChatAgentExecutor(AgentExecutor):
-    def __init__(self, chat_use_case: ChatUseCasePort) -> None:
-        self._chat_use_case = chat_use_case
+class ExecutorAgentExecutor(AgentExecutor):
+    def __init__(self, executor: ExecutorCallback) -> None:
+        self._executor = executor
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
-        task = context.current_task
-        if not task:
-            task = new_task_from_user_message(context.message)
-            await event_queue.enqueue_event(task)
+        a2a_task = context.current_task
+        if not a2a_task:
+            a2a_task = new_task_from_user_message(context.message)
+            await event_queue.enqueue_event(a2a_task)
 
         task_updater = TaskUpdater(
-            event_queue=event_queue, task_id=task.id, context_id=task.context_id
+            event_queue=event_queue, task_id=a2a_task.id, context_id=a2a_task.context_id
         )
         await task_updater.update_status(
             state=TaskState.TASK_STATE_WORKING,
             message=new_text_message("Processing request..."),
         )
 
-        query = get_message_text(context.message)
-        if not query:
-            await task_updater.add_artifact(
-                parts=[new_text_part(text="No text input is provided!", media_type="text/plain")]
+        # Live "thinking" hook: each call surfaces as a WORKING status message.
+        async def emit_thought(text: str) -> None:
+            await task_updater.update_status(
+                state=TaskState.TASK_STATE_WORKING,
+                message=new_text_message(text),
             )
-            await task_updater.update_status(state=TaskState.TASK_STATE_COMPLETED)
-            return
 
-        answer_parts: list[str] = []
+        task = Task(
+            id=a2a_task.id,
+            context_id=a2a_task.context_id,
+            message=get_message_text(context.message) or "",
+        )
+        user_context = build_user_context(emit_thought=emit_thought)
+
         try:
-            async for chunk in self._chat_use_case.handle(query):
-                if chunk.phase == StreamPhase.THINKING:
-                    await task_updater.update_status(
-                        state=TaskState.TASK_STATE_WORKING,
-                        message=new_text_message(chunk.text),
-                    )
-                else:
-                    answer_parts.append(chunk.text)
+            parts = await self._executor(task, user_context)
         except Exception as e:
             await task_updater.update_status(
                 state=TaskState.TASK_STATE_FAILED,
@@ -72,11 +77,9 @@ class ChatAgentExecutor(AgentExecutor):
             )
             return
 
-        answer = "".join(answer_parts)
-        # Final answer as an artifact, with NO trailing status message (see docstring).
-        await task_updater.add_artifact(
-            parts=[new_text_part(text=answer, media_type="text/plain")]
-        )
+        a2a_parts = ArtifactDTO.from_domain(parts).to_a2a_parts()
+        # Final answer(s) as a single Artifact, NO trailing status message.
+        await task_updater.add_artifact(parts=a2a_parts)
         await task_updater.update_status(state=TaskState.TASK_STATE_COMPLETED)
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:

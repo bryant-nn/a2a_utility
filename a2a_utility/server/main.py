@@ -1,60 +1,31 @@
 """Composition Root — conditional wiring AND mode-based route mounting.
 
-plan.md §3 (Mode-Based Route Mounting): each SERVER_MODE exposes only its own
-endpoints, wired dynamically from settings.server_mode.
-
 Two ways to start a node:
 
-1. CLI (env-var driven), for standalone processes / containers:
+1. CLI (env-var driven):
 
     A2A_SERVER_MODE=AGENT      python -m a2a_utility.server.main
     A2A_SERVER_MODE=DISCOVERY  python -m a2a_utility.server.main
 
-2. Function call, for embedding a node inside another process (tests, a
-   script that wants an in-process discovery node, a single entrypoint that
-   starts several nodes on different threads/tasks, etc.) — no env vars or
-   subprocess required:
+2. Function call (embed a node in another process):
 
     from a2a_utility.server.config import A2ASettings, ServerMode
     from a2a_utility.server.main import run_discovery_server
-
     run_discovery_server(A2ASettings(server_mode=ServerMode.DISCOVERY, port=8090))
-
-   run_agent_server() is the AGENT-mode counterpart. Both are blocking calls
-   (they call uvicorn.run internally) — same as the CLI path, just callable
-   directly instead of only reachable via `python -m`.
 
 Common endpoint (both modes):
     GET  /.well-known/agent.json        -> this node's Agent Card
     GET  /.well-known/agent-card.json   -> same card (a2a-sdk default name)
 
-AGENT mode (LLM chat; no discovery routes, no registry):
-    POST /a2a/v1/chat                   -> ChatAgentExecutor -> ChatUseCase
-    (OpenAILLMAdapter is the outbound LLM; closed via Starlette lifespan.)
+AGENT mode (Executor-Callback model; no discovery routes, no registry):
+    POST /a2a/v1/chat -> ExecutorAgentExecutor -> the demo executor callback,
+    which returns Typed Parts (text + thinking_process + source_reference +
+    file) packed into one Artifact. This is the adjust.md §step-4 demo.
 
-DISCOVERY mode (zero LLM; no chat routes, OpenAILLMAdapter NEVER constructed):
-    POST /register                        -> RegisterAgentCardUseCase (heartbeat; plain REST, not A2A —
-                                              registration is structured data, not a chat-shaped query,
-                                              so it doesn't map onto an A2A Task/Message)
-    GET  /agents                          -> SearchAgentUseCase.list_all (TTL-alive; plain REST, not A2A —
-                                              kept byte-compatible with the old registry/server.py contract)
-    POST /  and  POST /a2a/v1/discovery   -> real A2A JSON-RPC (SendMessage/SendStreamingMessage), routed
-                                              through DefaultRequestHandler -> DiscoveryAgentExecutor ->
-                                              SearchAgentUseCase.search (empty query text = list_all).
-                                              Mounted at both paths: "/" matches the agent card's advertised
-                                              url (so a real A2A client resolving the card can actually call
-                                              it), "/a2a/v1/discovery" matches plan.md's named endpoint.
-
-The /register + /agents contract is byte-compatible with registry/server.py, so
-a DISCOVERY node is a drop-in registry: the four domain agents heartbeat their
-cards to it and the coordinator's list_agents() reads /agents from it unchanged.
-Run it on port 8090 to replace registry/server.py outright:
-
-    A2A_SERVER_MODE=DISCOVERY A2A_PORT=8090 python -m a2a_server.main
-
-The domain agents themselves still use a2a_utility.server.serve_as_a2a()
-(AGENT-style, pluggable handler) — this file is the standalone AGENT/DISCOVERY
-node entry.
+DISCOVERY mode (zero LLM; no chat routes):
+    POST /register                        -> RegisterAgentCardUseCase (heartbeat, REST)
+    GET  /agents                          -> SearchAgentUseCase.list_all (TTL, REST)
+    POST /  and  POST /a2a/v1/discovery   -> DiscoveryAgentExecutor (A2A JSON-RPC)
 """
 
 import contextlib
@@ -76,15 +47,15 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from .adapters.inbound.chat_agent_executor import ChatAgentExecutor
+from .adapters.inbound.chat_agent_executor import ExecutorAgentExecutor
 from .adapters.inbound.discovery_agent_executor import DiscoveryAgentExecutor
 from .adapters.outbound.in_memory_registry_adapter import InMemoryRegistryAdapter
-from .adapters.outbound.openai_llm_adapter import OpenAILLMAdapter
-from .application.use_cases.chat_use_case import ChatUseCase
+from .application.dtos import Task, UserContext
 from .application.use_cases.register_agent_card_use_case import RegisterAgentCardUseCase
 from .application.use_cases.search_agent_use_case import SearchAgentUseCase
-from .config import A2ASettings, LLMSettings, ServerMode
+from .config import A2ASettings, ServerMode
 from .domain.models.agent_card import AgentDescriptor
+from .domain.models.part import Part
 
 REGISTRY_TTL_SECONDS = 15.0
 
@@ -110,9 +81,6 @@ def _build_agent_card(settings: A2ASettings, skill: AgentSkill) -> AgentCard:
 
 def _agent_card_route(agent_card: AgentCard) -> Route:
     """Common endpoint: GET /.well-known/agent.json -> this node's card."""
-
-    # a2a.types.AgentCard is a protobuf message (A2A 1.0), not a pydantic model,
-    # so serialize it with the protobuf JSON helper.
     card_dict = MessageToDict(agent_card, preserving_proto_field_name=True)
 
     async def get_agent_card(request: Request) -> JSONResponse:
@@ -125,34 +93,39 @@ def _serve(app: Starlette, settings: A2ASettings) -> None:
     uvicorn.run(app, host=settings.host, port=settings.port)
 
 
+async def _demo_executor(task: Task, ctx: UserContext) -> list[Part]:
+    """adjust.md §step-4 demo: return an Artifact of Typed Parts.
+
+    Streams two live thoughts, then returns one Part of each dataType so the
+    /a2a/v1/chat response demonstrates the full Data Contract.
+    """
+    if ctx.emit_thought is not None:
+        await ctx.emit_thought("Parsing the request...")
+        await ctx.emit_thought("Composing a typed-parts answer...")
+
+    return [
+        Part.thinking_process({"type": "reasoning", "text": "Picked a canned demo reply."}),
+        Part.source_reference({"source": "demo", "note": "no real data source"}),
+        Part.text(f"You said: {task.message!r}. This is a demo executor callback."),
+        Part.file({"filename": "demo.txt", "media_type": "text/plain", "content": "hello"}),
+    ]
+
+
 def run_agent_server(settings: Optional[A2ASettings] = None) -> None:
-    """AGENT mode: OpenAILLMAdapter -> ChatUseCase -> ChatAgentExecutor.
+    """AGENT mode: ExecutorAgentExecutor wrapping the demo executor callback.
 
-    Mounts ONLY the chat endpoint (POST /a2a/v1/chat) + card routes. No registry
-    or discovery routes are installed.
-
-    `settings` defaults to `A2ASettings()` (env-var driven) so this still works
-    as the target of `python -m a2a_utility.server.main`; pass an explicit
-    instance to embed a node in another process without touching env vars.
+    Mounts ONLY the chat endpoint (POST /a2a/v1/chat) + card routes.
     """
     settings = settings or A2ASettings()  # type: ignore[call-arg]
-    llm_settings = LLMSettings()  # type: ignore[call-arg]
-    llm_adapter = OpenAILLMAdapter(
-        base_url=llm_settings.base_url,
-        api_key=llm_settings.api_key,
-        model=llm_settings.model,
-        system_prompt=llm_settings.system_prompt,
-    )
-    chat_use_case = ChatUseCase(llm_service=llm_adapter)
-    executor = ChatAgentExecutor(chat_use_case=chat_use_case)
+    executor = ExecutorAgentExecutor(_demo_executor)
 
     skill = AgentSkill(
         id="chat",
         name="General Chat",
-        description="Forward user queries to an LLM and stream the response.",
+        description="Demo executor returning typed Parts as an Artifact.",
         input_modes=["text/plain"],
         output_modes=["text/plain"],
-        tags=["chat", "llm"],
+        tags=["chat"],
         examples=["Tell me a joke", "Summarize this article"],
     )
     agent_card = _build_agent_card(settings, skill)
@@ -165,35 +138,14 @@ def run_agent_server(settings: Optional[A2ASettings] = None) -> None:
 
     routes = [_agent_card_route(agent_card)]
     routes.extend(create_agent_card_routes(agent_card))  # /.well-known/agent-card.json
-    # A2A JSON-RPC handler mounted at the chat path (plan.md §3: POST /a2a/v1/chat)
     routes.extend(create_jsonrpc_routes(request_handler, "/a2a/v1/chat"))
 
-    @contextlib.asynccontextmanager
-    async def lifespan(app: Starlette):
-        try:
-            yield
-        finally:
-            await llm_adapter.aclose()
-
-    app = Starlette(routes=routes, lifespan=lifespan)
+    app = Starlette(routes=routes)
     _serve(app, settings)
 
 
 def run_discovery_server(settings: Optional[A2ASettings] = None) -> None:
-    """DISCOVERY mode: registry-backed discovery. No LLM adapter is created.
-
-    /register and /agents stay plain REST (see module docstring for why —
-    registration is structured data, not a chat-shaped query, so it doesn't
-    map onto an A2A Task/Message). The actual "who can do X?" query goes
-    through a real A2A JSON-RPC endpoint backed by DiscoveryAgentExecutor,
-    exactly the same shape AGENT mode uses for chat — no more hand-rolled
-    REST closure standing in for what should be an A2A conversation.
-
-    `settings` defaults to `A2ASettings()` (env-var driven); pass an explicit
-    instance (e.g. `A2ASettings(server_mode=ServerMode.DISCOVERY, port=8090)`)
-    to start a discovery node in-process — a script, a test fixture, or
-    another server's own startup code — without shelling out to `python -m`.
-    """
+    """DISCOVERY mode: registry-backed discovery. No LLM/executor is created."""
     settings = settings or A2ASettings()  # type: ignore[call-arg]
     registry = InMemoryRegistryAdapter(ttl_seconds=REGISTRY_TTL_SECONDS)
     register_use_case = RegisterAgentCardUseCase(registry)
@@ -241,9 +193,6 @@ def run_discovery_server(settings: Optional[A2ASettings] = None) -> None:
         _agent_card_route(agent_card),
         Route("/register", register, methods=["POST"]),
         Route("/agents", list_agents, methods=["GET"]),
-        # "/" matches agent_card's advertised url so a real A2A client that
-        # resolved the card can actually call it; "/a2a/v1/discovery" is the
-        # named endpoint from plan.md. Both are the same JSON-RPC dispatcher.
         *create_jsonrpc_routes(discovery_request_handler, "/"),
         *create_jsonrpc_routes(discovery_request_handler, "/a2a/v1/discovery"),
     ]
