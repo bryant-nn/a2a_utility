@@ -12,22 +12,23 @@ Three entry points:
   - call_agent_parts(...)  -> list[ExtendedPart]
   - call_agent(...)        -> str              (concatenated text parts = the answer)
 
-WORKING status messages are forwarded live to `emit_thought` as they stream.
+WORKING status messages are forwarded live to `emit` (a PartEmitter — the same
+callback type a server-side handler receives) as they stream: every part in
+the status message, not just text, so a caller can react to a live source
+reference/file the same way it reacts to live thinking text.
 """
 
 from __future__ import annotations
 
 import uuid
-from typing import Awaitable, Callable, Optional
+from typing import Optional
 
 import httpx
 from a2a.client import ClientConfig, create_client
 from a2a.helpers import new_text_part
 from a2a.types import Message, Role, SendMessageRequest, TaskState
 
-from ..types import A2ATaskResult, ExtendedArtifact, ExtendedPart
-
-ThoughtEmitter = Callable[[str], Awaitable[None]]
+from ..schema import A2ATaskResult, ExtendedArtifact, ExtendedMessage, ExtendedPart, PartEmitter
 
 
 class A2ACallError(RuntimeError):
@@ -48,7 +49,7 @@ async def call_agent_result(
     base_url: str,
     text: str,
     *,
-    emit_thought: Optional[ThoughtEmitter] = None,
+    emit: Optional[PartEmitter] = None,
     timeout: Optional[float] = None,
 ) -> A2ATaskResult:
     """Send `text` to the A2A agent at base_url; return a typed A2ATaskResult.
@@ -59,6 +60,7 @@ async def call_agent_result(
     task_id = ""
     status = ""
     artifacts: list[ExtendedArtifact] = []
+    history: list[ExtendedMessage] = []
 
     async with httpx.AsyncClient(timeout=timeout) as http:
         client = await create_client(
@@ -72,10 +74,9 @@ async def call_agent_result(
                     st = su.status
                     status = TaskState.Name(st.state)
                     if st.state == TaskState.TASK_STATE_WORKING and st.HasField("message"):
-                        if emit_thought:
+                        if emit:
                             for p in st.message.parts:
-                                if p.HasField("text"):
-                                    await emit_thought(p.text)
+                                await emit(ExtendedPart.from_protobuf(p))
                     elif st.state == TaskState.TASK_STATE_FAILED:
                         detail = "unknown error"
                         if st.HasField("message") and st.message.parts:
@@ -91,20 +92,21 @@ async def call_agent_result(
                     status = TaskState.Name(t.status.state)
                     for a in t.artifacts:
                         artifacts.append(ExtendedArtifact.from_protobuf(a))
+                    history = [ExtendedMessage.from_protobuf(m) for m in t.history]
         finally:
             await client.close()
 
-    return A2ATaskResult(task_id=task_id, status=status, artifacts=artifacts)
+    return A2ATaskResult(task_id=task_id, status=status, artifacts=artifacts, history=history)
 
 
 async def call_agent_parts(
     base_url: str,
     text: str,
     *,
-    emit_thought: Optional[ThoughtEmitter] = None,
+    emit: Optional[PartEmitter] = None,
     timeout: Optional[float] = None,
 ) -> list[ExtendedPart]:
-    result = await call_agent_result(base_url, text, emit_thought=emit_thought, timeout=timeout)
+    result = await call_agent_result(base_url, text, emit=emit, timeout=timeout)
     return result.parts()
 
 
@@ -112,9 +114,9 @@ async def call_agent(
     base_url: str,
     text: str,
     *,
-    emit_thought: Optional[ThoughtEmitter] = None,
+    emit: Optional[PartEmitter] = None,
     timeout: Optional[float] = None,
 ) -> str:
     """Convenience: return only the concatenated text parts (the answer)."""
-    result = await call_agent_result(base_url, text, emit_thought=emit_thought, timeout=timeout)
+    result = await call_agent_result(base_url, text, emit=emit, timeout=timeout)
     return result.text()
