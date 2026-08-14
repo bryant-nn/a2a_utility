@@ -32,12 +32,7 @@ import uvicorn
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
 from a2a.server.tasks import InMemoryTaskStore
-from a2a.types import (
-    AgentCapabilities,
-    AgentCard,
-    AgentInterface,
-    AgentSkill,
-)
+from a2a.types import AgentCard
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -52,11 +47,11 @@ from .application.ports.inbound.on_cancel_port import OnCancelPort
 from .application.ports.outbound.registry_port import AgentRegistryPort
 from .application.use_cases.register_agent_card_use_case import RegisterAgentCardUseCase
 from .application.use_cases.search_agent_use_case import SearchAgentUseCase
+from .card import ExtendAgentCard
 from .config import ServerMode
 from .domain.models.agent_card import AgentDescriptor
 
 __all__ = [
-    "build_agent_card",
     "create_app",
     "serve",
     "serve_as_a2a",
@@ -106,46 +101,8 @@ def _make_lifespan(registry_url: Optional[str], payload: dict):
 
 
 # --------------------------------------------------------------------------- #
-# Card + app composition                                                       #
+# App composition (card-building models live in card.py)                       #
 # --------------------------------------------------------------------------- #
-def build_agent_card(
-    *,
-    name: str,
-    description: str,
-    skill_id: str,
-    skill_name: str,
-    skill_description: str,
-    examples: list[str],
-    host: str,
-    port: int,
-) -> AgentCard:
-    skill = AgentSkill(
-        id=skill_id,
-        name=skill_name,
-        description=skill_description,
-        input_modes=["text/plain"],
-        output_modes=["text/plain"],
-        tags=[skill_id],
-        examples=examples,
-    )
-    return AgentCard(
-        name=name,
-        description=description,
-        version="0.1.0",
-        default_input_modes=["text/plain"],
-        default_output_modes=["text/plain"],
-        capabilities=AgentCapabilities(streaming=True),
-        supported_interfaces=[
-            AgentInterface(
-                protocol_binding="JSONRPC",
-                url=f"http://{host}:{port}",
-                protocol_version="1.0",
-            )
-        ],
-        skills=[skill],
-    )
-
-
 def _create_discovery_app(
     *,
     agent_card: AgentCard,
@@ -267,55 +224,44 @@ def serve(app: Starlette, *, host: str = "127.0.0.1", port: int) -> None:
 
 def serve_as_a2a(
     *,
-    mode: ServerMode = ServerMode.AGENT,
+    card: ExtendAgentCard,
     handler: Optional[AgentHandlerPort] = None,
     on_cancel: Optional[OnCancelPort] = None,
-    name: str,
-    description: str,
-    skill_id: str,
-    skill_name: str,
-    skill_description: str,
-    examples: list[str],
-    host: str = "127.0.0.1",
-    port: int,
+    mode: ServerMode = ServerMode.AGENT,
     registry_url: Optional[str] = None,
     registry: Optional[AgentRegistryPort] = None,
 ) -> None:
-    """One-call convenience: build the card, create the app, and serve it.
+    """One-call convenience: from a single ExtendAgentCard, build the a2a card,
+    create the app, and serve it.
+
+    A domain agent passes `card=ExtendAgentCard(name=..., description=...,
+    port=..., skills=[ExtendAgentSkill(...)])` (host defaults to 127.0.0.1) — all
+    the a2a boilerplate (version, modes, capabilities, JSONRPC interface) is
+    filled internally. host/port come from the card.
 
     mode=AGENT (default): `handler` (required) is a domain-agent-authored
-    AgentHandlerPort — a plain async function, or an object with __call__ if
-    the agent wants to hold construction state. No a2a_utility class to
-    import or subclass. `on_cancel` is optional (see create_app's docstring).
-    If registry_url is given, self-registers {name, description,
-    agent_card_url} and heartbeats.
+    AgentHandlerPort — a plain async function, or an object with __call__ if the
+    agent wants to hold construction state. `on_cancel` is optional (see
+    create_app's docstring). If registry_url is given, self-registers
+    {name, description, agent_card_url} and heartbeats.
 
-    mode=DISCOVERY: `handler`/`on_cancel`/registry_url/registration are
-    irrelevant (a registry node doesn't self-register anywhere) and ignored;
-    pass `registry` to inject a non-default AgentRegistryPort.
+    mode=DISCOVERY: `handler`/`on_cancel`/registry_url are ignored (a registry
+    node doesn't self-register); pass `registry` to inject a non-default
+    AgentRegistryPort.
     """
-    agent_card = build_agent_card(
-        name=name,
-        description=description,
-        skill_id=skill_id,
-        skill_name=skill_name,
-        skill_description=skill_description,
-        examples=examples,
-        host=host,
-        port=port,
-    )
+    agent_card = card.to_agent_card()
     if mode == ServerMode.DISCOVERY:
         app = create_app(mode=mode, agent_card=agent_card, registry=registry)
-        serve(app, host=host, port=port)
+        serve(app, host=card.host, port=card.port)
         return
 
     if handler is None:
         raise ValueError("serve_as_a2a(mode=AGENT) requires a `handler`")
 
     registration_payload = {
-        "name": name,
-        "description": description,
-        "agent_card_url": f"http://{host}:{port}/.well-known/agent-card.json",
+        "name": card.name,
+        "description": card.description,
+        "agent_card_url": card.agent_card_url,
     }
     app = create_app(
         mode=mode,
@@ -325,4 +271,4 @@ def serve_as_a2a(
         registry_url=registry_url,
         registration_payload=registration_payload,
     )
-    serve(app, host=host, port=port)
+    serve(app, host=card.host, port=card.port)

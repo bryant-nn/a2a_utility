@@ -45,7 +45,8 @@ from a2a.server.events import EventQueue
 from .adapters.inbound.agent_executor import AgentExecutor
 from .adapters.inbound.call_context_builder import A2AUtilityCallContextBuilder, get_principal
 from .adapters.outbound.event_queue_adapter import ExtendedEventQueue
-from .app import build_agent_card, create_app, serve, serve_as_a2a
+from .app import create_app, serve, serve_as_a2a
+from .card import ExtendAgentCard, ExtendAgentSkill, build_agent_card
 from .application.dtos import (
     CancelResult,
     ExtendedRequestContext,
@@ -75,6 +76,8 @@ from .main import run_agent_server, run_discovery_server
 
 __all__ = [
     # composition
+    "ExtendAgentSkill",
+    "ExtendAgentCard",
     "build_agent_card",
     "create_app",
     "serve",

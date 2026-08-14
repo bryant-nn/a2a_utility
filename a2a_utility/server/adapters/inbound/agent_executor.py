@@ -54,6 +54,11 @@ class AgentExecutor(_NativeAgentExecutor):
             await eq.failed(f"Agent error: {e}")
             return
 
+        # Dispatch on the discriminated HandlerResult the handler returned — the
+        # agent decides how the task ends, a2a_utility just maps it onto the
+        # matching terminal event. A non-HandlerResult return is a programming
+        # error in the handler; surface it as a FAILED task with a clear message
+        # (the type guard) instead of silently leaving the task un-terminated.
         if isinstance(result, HandlerCompleted):
             await eq.complete(result.parts)
         elif isinstance(result, HandlerFailed):
@@ -64,6 +69,12 @@ class AgentExecutor(_NativeAgentExecutor):
             await eq.requires_auth(result.message)
         elif isinstance(result, HandlerCanceled):
             await eq.cancel(result.message)
+        else:
+            await eq.failed(
+                f"handler returned {type(result).__name__}, expected a HandlerResult "
+                "(HandlerCompleted / HandlerFailed / HandlerInputRequired / "
+                "HandlerAuthRequired / HandlerCanceled)"
+            )
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         """Reacts to an externally-requested cancellation (a client's cancel

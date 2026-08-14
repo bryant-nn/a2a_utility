@@ -47,7 +47,13 @@ server/
 │       └── in_memory_registry_adapter.py   把記憶體 dict + TTL 包成 AgentRegistryPort
 │
 ├── config.py                        A2ASettings（A2A_ 前綴），pydantic-settings
-├── app.py                           build_agent_card / create_app(mode=) / serve / serve_as_a2a — composition root
+├── card.py                          ExtendAgentSkill / ExtendAgentCard（包 a2a protobuf AgentCard/AgentSkill 的
+│                                     Pydantic 卡片模型，protobuf 不能繼承所以用包裝）+ build_agent_card。
+│                                     domain agent 建卡只填 name/description/host/port + skills=[...]
+│                                     （對應 AgentCard.skills 這個 list[AgentSkill] repeated 欄位，至少一個），
+│                                     version/modes/capabilities/JSONRPC interface 內部預設
+├── app.py                           create_app(mode=) / serve / serve_as_a2a — composition root（純組裝，
+│                                     卡片模型已抽到 card.py）
 └── main.py                          獨立可執行節點：依 A2A_SERVER_MODE 決定組出 AGENT 示範節點還是 DISCOVERY 節點
 ```
 
@@ -120,7 +126,15 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-from a2a_utility.server import ExtendedRequestContext, HandlerCompleted, HandlerResult, PartEmitter, serve_as_a2a
+from a2a_utility.server import (
+    ExtendAgentCard,
+    ExtendAgentSkill,
+    ExtendedRequestContext,
+    HandlerCompleted,
+    HandlerResult,
+    PartEmitter,
+    serve_as_a2a,
+)
 from a2a_utility.schema import ExtendedPart, as_thinking_emitter
 from agent import handle
 
@@ -133,13 +147,17 @@ async def handle_task(context: ExtendedRequestContext, emit: PartEmitter) -> Han
 if __name__ == "__main__":
     serve_as_a2a(
         handler=handle_task,
-        name="joke_agent",
-        description="Tells a short joke related to whatever you ask about.",
-        skill_id="joke",
-        skill_name="Joke",
-        skill_description="Tell a joke related to the given topic.",
-        examples=["跟工程師有關的笑話", "tell me a joke about cats"],
-        port=9050,
+        card=ExtendAgentCard(
+            name="joke_agent",
+            description="Tells a short joke related to whatever you ask about.",
+            port=9050,   # host 預設 127.0.0.1
+            skills=[ExtendAgentSkill(
+                id="joke",
+                name="Joke",
+                description="Tell a joke related to the given topic.",
+                examples=["跟工程師有關的笑話", "tell me a joke about cats"],
+            )],
+        ),
         registry_url="http://127.0.0.1:8090",   # 給了這個，啟動時就會自動登記 + 每 5 秒 heartbeat
     )
 ```

@@ -17,7 +17,8 @@ from typing import Optional
 
 from a2a.types import AgentSkill
 
-from .app import build_agent_card, create_app, serve
+from .app import create_app, serve
+from .card import build_agent_card
 from .application.dtos import ExtendedRequestContext, HandlerCompleted, HandlerResult
 from .config import A2ASettings, ServerMode
 from ..schema import ExtendedPart, PartEmitter

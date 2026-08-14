@@ -43,7 +43,10 @@ pip install -e /path/to/a2a_utility[server,client]
 `a2a.*`，也不用繼承任何 `a2a_utility` 提供的類別：
 
 ```python
-from a2a_utility.server import ExtendedRequestContext, HandlerCompleted, HandlerResult, PartEmitter, serve_as_a2a
+from a2a_utility.server import (
+    ExtendAgentCard, ExtendAgentSkill,
+    ExtendedRequestContext, HandlerCompleted, HandlerResult, PartEmitter, serve_as_a2a,
+)
 from a2a_utility.schema import ExtendedPart, as_thinking_emitter
 
 async def handle_business_logic(text: str, emit_thought) -> str:
@@ -56,9 +59,11 @@ async def handle(context: ExtendedRequestContext, emit: PartEmitter) -> HandlerR
     return HandlerCompleted(parts=[ExtendedPart.from_text(answer)])
 
 serve_as_a2a(
-    name="joke_agent", description="...", skill_id="joke",
-    skill_name="Joke", skill_description="...", examples=["..."],
-    handler=handle, port=9050,
+    handler=handle,
+    card=ExtendAgentCard(                        # 只填重要的值；其餘 a2a 樣板內部預設
+        name="joke_agent", description="...", port=9050,   # host 預設 127.0.0.1
+        skills=[ExtendAgentSkill(id="joke", name="Joke", description="...", examples=["..."])],
+    ),
     registry_url="http://127.0.0.1:8090",  # 給了就自動註冊 + heartbeat
 )
 ```
@@ -172,7 +177,8 @@ a2a_utility/server/
     outbound/
       event_queue_adapter.py      ExtendedEventQueue：包住原生 TaskUpdater 的 emit()/complete()/failed()/...
       in_memory_registry_adapter.py  記憶體 + TTL 實作 AgentRegistryPort
-  app.py       build_agent_card / create_app(mode=) / serve / serve_as_a2a — composition root
+  card.py      ExtendAgentSkill / ExtendAgentCard（包 a2a protobuf AgentCard/AgentSkill 的 Pydantic 卡片模型）+ build_agent_card
+  app.py       create_app(mode=) / serve / serve_as_a2a — composition root（純組裝，卡片模型抽到 card.py）
   config.py    A2ASettings（pydantic-settings，A2A_ 前綴）
   main.py      獨立可執行節點：依 A2A_SERVER_MODE 決定 AGENT 示範節點還是 DISCOVERY 節點
 ```

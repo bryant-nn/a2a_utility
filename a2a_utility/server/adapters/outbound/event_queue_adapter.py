@@ -43,6 +43,17 @@ from a2a.types import TaskState
 from ....schema import ExtendedPart
 
 
+def _require_part(part: object) -> None:
+    if not isinstance(part, ExtendedPart):
+        raise TypeError(
+            f"ExtendedEventQueue expected an ExtendedPart, got {type(part).__name__}. "
+            "Build parts with a2a_utility.schema.ExtendedPart (from_text/thinking/"
+            "source_reference/file) — raw dicts/protos are rejected here so a "
+            "wrongly-typed value fails at the source instead of silently reaching "
+            "the native queue and blowing up downstream."
+        )
+
+
 class ExtendedEventQueue:
     def __init__(self, context: RequestContext, event_queue: EventQueue) -> None:
         task = context.current_task
@@ -78,6 +89,7 @@ class ExtendedEventQueue:
         `a2a_utility.schema.as_thinking_emitter()` for code that only ever
         streams plain thinking text.
         """
+        _require_part(part)
         await self._ensure_task()
         await self._u.update_status(
             state=TaskState.TASK_STATE_WORKING,
@@ -87,6 +99,8 @@ class ExtendedEventQueue:
     async def add_artifact(
         self, parts: list[ExtendedPart], *, name: Optional[str] = None
     ) -> None:
+        for part in parts:
+            _require_part(part)
         await self._ensure_task()
         await self._u.add_artifact(parts=[p.to_protobuf() for p in parts], name=name)
 
