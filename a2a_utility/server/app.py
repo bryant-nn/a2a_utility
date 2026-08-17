@@ -29,25 +29,38 @@ from typing import Optional
 
 import httpx
 import uvicorn
+from a2a.server.id_generator import IDGenerator
 from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
-from a2a.server.tasks import InMemoryTaskStore
-from a2a.types import AgentCard
+from a2a.server.routes import (
+    create_agent_card_routes,
+    create_jsonrpc_routes,
+    create_rest_routes,
+)
+from a2a.server.routes.common import ServerCallContextBuilder
+from a2a.server.tasks import (
+    InMemoryTaskStore,
+    PushNotificationConfigStore,
+    PushNotificationSender,
+    TaskStore,
+)
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.routing import Route
+from starlette.routing import BaseRoute, Route
 
 from .adapters.inbound.agent_executor import AgentExecutor
 from .adapters.inbound.call_context_builder import A2AUtilityCallContextBuilder
 from .adapters.inbound.discovery_agent_executor import DiscoveryAgentExecutor
 from .adapters.outbound.in_memory_registry_adapter import InMemoryRegistryAdapter
 from .application.ports.inbound.agent_handler_port import AgentHandlerPort
+from .application.ports.inbound.gate_keeper_port import GateKeeperPort
 from .application.ports.inbound.on_cancel_port import OnCancelPort
+from .application.services.gate_keeper import AllowAllGateKeeper
 from .application.ports.outbound.registry_port import AgentRegistryPort
 from .application.use_cases.register_agent_card_use_case import RegisterAgentCardUseCase
 from .application.use_cases.search_agent_use_case import SearchAgentUseCase
-from .card import ExtendAgentCard
+from .card import ExtendedAgentCard
 from .config import ServerMode
 from .domain.models.agent_card import AgentDescriptor
 
@@ -83,12 +96,30 @@ async def _heartbeat_loop(registry_url: str, payload: dict) -> None:
             await asyncio.sleep(REGISTRY_HEARTBEAT_SECONDS)
 
 
-def _make_lifespan(registry_url: Optional[str], payload: dict):
+def _make_lifespan(
+    request_handler: DefaultRequestHandler,
+    registry_url: Optional[str] = None,
+    payload: Optional[dict] = None,
+):
+    """Startup/shutdown for both modes.
+
+    Two responsibilities:
+
+      - The optional registry heartbeat (AGENT mode with `registry_url`).
+      - Draining the request handler on shutdown. `DefaultRequestHandler` is
+        `DefaultRequestHandlerV2`, whose `aclose()` docstring states it is
+        "intended to be wired into an ASGI `lifespan` / `on_shutdown` hook" —
+        without it, its `ActiveTaskRegistry` leaves pending asyncio tasks
+        behind when the server stops. This applies to DISCOVERY mode too,
+        which is why that mode gets a lifespan now rather than a bare
+        `Starlette(routes=...)`.
+    """
+
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette):
         task = None
         if registry_url:
-            task = asyncio.create_task(_heartbeat_loop(registry_url, payload))
+            task = asyncio.create_task(_heartbeat_loop(registry_url, payload or {}))
         try:
             yield
         finally:
@@ -96,8 +127,42 @@ def _make_lifespan(registry_url: Optional[str], payload: dict):
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+            await request_handler.aclose()
 
     return lifespan
+
+
+# --------------------------------------------------------------------------- #
+# Auth wiring                                                                  #
+# --------------------------------------------------------------------------- #
+def _resolve_gate_keeper(
+    gate_keeper: Optional[GateKeeperPort], require_auth: bool, agent_name: str
+) -> GateKeeperPort:
+    """The gate to install, refusing to start if auth is required but absent.
+
+    The default is permissive on purpose — a developer running an agent
+    locally shouldn't need a token issuer — but a permissive default is only
+    safe if forgetting it is loud. Hence the warning here and the hard failure
+    under `require_auth`, which deployments set via `A2A_REQUIRE_AUTH=true`.
+    """
+    if gate_keeper is not None:
+        return gate_keeper
+
+    if require_auth:
+        raise ValueError(
+            f"{agent_name}: require_auth is set but no gate_keeper was given. "
+            "Pass gate_keeper=GateKeeper(...), or build one from settings with "
+            "A2ASettings().build_gate_keeper() (needs A2A_JWKS_URL)."
+        )
+
+    logger.warning(
+        "%s: no gate_keeper configured — every request is allowed and "
+        "context.user will be unauthenticated. Fine for local development; "
+        "set A2A_REQUIRE_AUTH=true in deployed environments so this can't "
+        "ship by accident.",
+        agent_name,
+    )
+    return AllowAllGateKeeper()
 
 
 # --------------------------------------------------------------------------- #
@@ -105,9 +170,10 @@ def _make_lifespan(registry_url: Optional[str], payload: dict):
 # --------------------------------------------------------------------------- #
 def _create_discovery_app(
     *,
-    agent_card: AgentCard,
+    agent_card: ExtendedAgentCard,
     rpc_url: str = "/",
     registry: Optional[AgentRegistryPort] = None,
+    context_builder: Optional[ServerCallContextBuilder] = None,
 ) -> Starlette:
     """DISCOVERY mode: registry-backed discovery, zero LLM/executor.
 
@@ -115,6 +181,7 @@ def _create_discovery_app(
     data doesn't fit A2A's Task/Message shape) alongside the real A2A JSON-RPC
     "who can do X?" search route, backed by DiscoveryAgentExecutor.
     """
+    proto_card = agent_card.to_agent_card()
     registry = registry or InMemoryRegistryAdapter(ttl_seconds=REGISTRY_TTL_SECONDS)
     register_use_case = RegisterAgentCardUseCase(registry)
     search_use_case = SearchAgentUseCase(registry)
@@ -143,9 +210,9 @@ def _create_discovery_app(
     discovery_request_handler = DefaultRequestHandler(
         agent_executor=discovery_executor,
         task_store=InMemoryTaskStore(),
-        agent_card=agent_card,
+        agent_card=proto_card,
     )
-    context_builder = A2AUtilityCallContextBuilder()
+    context_builder = context_builder or A2AUtilityCallContextBuilder()
 
     routes: list[Route] = [
         Route("/register", register, methods=["POST"]),
@@ -158,62 +225,131 @@ def _create_discovery_app(
                 discovery_request_handler, "/a2a/v1/discovery", context_builder=context_builder
             )
         )
-    routes.extend(create_agent_card_routes(agent_card))
+    routes.extend(create_agent_card_routes(proto_card))
 
-    return Starlette(routes=routes)
+    return Starlette(routes=routes, lifespan=_make_lifespan(discovery_request_handler))
 
 
 def create_app(
     *,
     mode: ServerMode = ServerMode.AGENT,
-    agent_card: AgentCard,
+    agent_card: ExtendedAgentCard,
     handler: Optional[AgentHandlerPort] = None,
     on_cancel: Optional[OnCancelPort] = None,
     registry_url: Optional[str] = None,
     registration_payload: Optional[dict] = None,
     rpc_url: str = "/",
     registry: Optional[AgentRegistryPort] = None,
+    context_builder: Optional[ServerCallContextBuilder] = None,
+    message_id_generator: Optional[IDGenerator] = None,
+    gate_keeper: Optional[GateKeeperPort] = None,
+    required_permission: Optional[str] = None,
+    require_auth: bool = False,
+    task_store: Optional[TaskStore] = None,
+    push_config_store: Optional[PushNotificationConfigStore] = None,
+    push_sender: Optional[PushNotificationSender] = None,
+    middleware: Optional[list[Middleware]] = None,
+    extra_routes: Optional[list[BaseRoute]] = None,
+    include_rest_routes: bool = False,
 ) -> Starlette:
     """Wire an A2A Starlette app, in either mode.
 
+    Takes an `ExtendedAgentCard` and converts it to the native protobuf card
+    internally, so a caller never handles `a2a.types.AgentCard` directly.
+
     mode=AGENT (default): wraps a domain agent's `handler` (required — a plain
     AgentHandlerPort callable, not an AgentExecutor) behind the native a2a
-    request handler. Injects a2a_utility's ServerCallContextBuilder so every
-    request carries a typed Principal reachable via
-    ExtendedRequestContext.principal inside the handler. `on_cancel` is an
-    optional second callable (OnCancelPort) reacting to an externally
-    requested cancellation; most agents don't need it — the default cancel
-    behavior (mark CANCELED, no custom message) is fine.
+    request handler.
 
-    mode=DISCOVERY: `handler`/`on_cancel` are not used (a registry node has no
-    LLM/domain logic of its own) — see _create_discovery_app for what gets
-    wired instead. `registry` lets a caller inject its own AgentRegistryPort
-    (e.g. for tests); defaults to a fresh InMemoryRegistryAdapter.
+    Auth:
+      `gate_keeper` runs before every handler invocation and can end the task
+      REJECTED/AUTH_REQUIRED without it ever reaching the handler; see
+      `application/services/gate_keeper.py`. `required_permission` is the
+      agent-level permission it checks. Omitting `gate_keeper` installs
+      `AllowAllGateKeeper` and logs a warning — convenient locally, wrong
+      everywhere else, which is what `require_auth=True` guards: it turns the
+      omission into a startup error rather than a silently open server.
+      Remember to declare the scheme on the card too (`ExtendedAgentCard
+      (auth=BearerAuth())`), or well-behaved clients won't know to send
+      anything.
+
+    Other injectables:
+      `on_cancel` reacts to an externally requested cancellation; most agents
+      don't need it (the default marks the task CANCELED).
+      `task_store` defaults to `InMemoryTaskStore`, which loses every task on
+      restart and can't be shared across replicas — pass a durable store for
+      anything beyond a single-process deployment.
+      `push_config_store`/`push_sender` enable push notifications; both are
+      needed for them to work.
+      `middleware` and `extra_routes` are merged into the Starlette app, for
+      health checks, metrics, or `GateMiddleware`.
+      `include_rest_routes` also mounts A2A's REST binding beside JSON-RPC.
+      Off by default: JSON-RPC is what `a2a_utility.client` and most A2A
+      clients speak, and every mounted route is more surface to secure.
+      `message_id_generator` is used only by `AgentExecutor`'s own paths (the
+      throwaway `ExtendedTaskUpdater` it builds for gate refusals and the
+      exception safety net) — a handler builds its own updater and can pass
+      whatever generators it likes there, per-instance.
+
+    mode=DISCOVERY: `handler`/`on_cancel`/`message_id_generator` are not used
+    (a registry node has no LLM/domain logic of its own) — see
+    _create_discovery_app for what gets wired instead. `registry` lets a
+    caller inject its own AgentRegistryPort (e.g. for tests); defaults to a
+    fresh InMemoryRegistryAdapter. `context_builder` applies here too, for
+    consistency with AGENT mode.
+
+    Raises:
+      ValueError: mode=AGENT with no `handler`, or `require_auth=True` with
+        no `gate_keeper`; mode=DISCOVERY with `gate_keeper`/`require_auth`/
+        `required_permission` set — DISCOVERY mode doesn't run them through
+        the gate yet, and silently dropping them would look like the auth
+        was applied when it wasn't.
     """
     if mode == ServerMode.DISCOVERY:
-        return _create_discovery_app(agent_card=agent_card, rpc_url=rpc_url, registry=registry)
+        if gate_keeper is not None or require_auth or required_permission is not None:
+            raise ValueError(
+                "create_app(mode=DISCOVERY) does not support gate_keeper/"
+                "require_auth/required_permission yet — a DISCOVERY node's "
+                "AgentExecutor doesn't run the gate. Passing them here would "
+                "silently leave the registry unauthenticated; if you need "
+                "this, put GateMiddleware in front instead."
+            )
+        return _create_discovery_app(
+            agent_card=agent_card, rpc_url=rpc_url, registry=registry, context_builder=context_builder
+        )
 
     if handler is None:
         raise ValueError("create_app(mode=AGENT) requires a `handler`")
 
+    gate_keeper = _resolve_gate_keeper(gate_keeper, require_auth, agent_card.name)
+
+    proto_card = agent_card.to_agent_card()
     request_handler = DefaultRequestHandler(
-        agent_executor=AgentExecutor(handler=handler, on_cancel=on_cancel),
-        task_store=InMemoryTaskStore(),
-        agent_card=agent_card,
+        agent_executor=AgentExecutor(
+            handler=handler,
+            on_cancel=on_cancel,
+            gate_keeper=gate_keeper,
+            required_permission=required_permission,
+            message_id_generator=message_id_generator,
+        ),
+        task_store=task_store or InMemoryTaskStore(),
+        agent_card=proto_card,
+        push_config_store=push_config_store,
+        push_sender=push_sender,
     )
 
-    routes = create_agent_card_routes(agent_card)
-    routes.extend(
-        create_jsonrpc_routes(
-            request_handler,
-            rpc_url,
-            context_builder=A2AUtilityCallContextBuilder(),
-        )
-    )
+    builder = context_builder or A2AUtilityCallContextBuilder()
+    routes: list[BaseRoute] = list(create_agent_card_routes(proto_card))
+    routes.extend(create_jsonrpc_routes(request_handler, rpc_url, context_builder=builder))
+    if include_rest_routes:
+        routes.extend(create_rest_routes(request_handler, context_builder=builder))
+    if extra_routes:
+        routes.extend(extra_routes)
 
     return Starlette(
         routes=routes,
-        lifespan=_make_lifespan(registry_url, registration_payload or {}),
+        middleware=middleware,
+        lifespan=_make_lifespan(request_handler, registry_url, registration_payload or {}),
     )
 
 
@@ -224,34 +360,47 @@ def serve(app: Starlette, *, host: str = "127.0.0.1", port: int) -> None:
 
 def serve_as_a2a(
     *,
-    card: ExtendAgentCard,
+    card: ExtendedAgentCard,
     handler: Optional[AgentHandlerPort] = None,
     on_cancel: Optional[OnCancelPort] = None,
     mode: ServerMode = ServerMode.AGENT,
     registry_url: Optional[str] = None,
     registry: Optional[AgentRegistryPort] = None,
+    context_builder: Optional[ServerCallContextBuilder] = None,
+    message_id_generator: Optional[IDGenerator] = None,
+    gate_keeper: Optional[GateKeeperPort] = None,
+    required_permission: Optional[str] = None,
+    require_auth: bool = False,
+    task_store: Optional[TaskStore] = None,
+    push_config_store: Optional[PushNotificationConfigStore] = None,
+    push_sender: Optional[PushNotificationSender] = None,
+    middleware: Optional[list[Middleware]] = None,
+    extra_routes: Optional[list[BaseRoute]] = None,
 ) -> None:
-    """One-call convenience: from a single ExtendAgentCard, build the a2a card,
-    create the app, and serve it.
+    """One-call convenience: from a single ExtendedAgentCard, create the app
+    and serve it.
 
-    A domain agent passes `card=ExtendAgentCard(name=..., description=...,
-    port=..., skills=[ExtendAgentSkill(...)])` (host defaults to 127.0.0.1) — all
-    the a2a boilerplate (version, modes, capabilities, JSONRPC interface) is
-    filled internally. host/port come from the card.
+    A domain agent passes `card=ExtendedAgentCard(name=..., description=...,
+    port=..., skills=[ExtendedAgentSkill(...)])` (host defaults to 127.0.0.1)
+    — all the a2a boilerplate (version, modes, capabilities, JSONRPC
+    interface) is filled internally. host/port come from the card.
 
     mode=AGENT (default): `handler` (required) is a domain-agent-authored
     AgentHandlerPort — a plain async function, or an object with __call__ if the
-    agent wants to hold construction state. `on_cancel` is optional (see
-    create_app's docstring). If registry_url is given, self-registers
-    {name, description, agent_card_url} and heartbeats.
+    agent wants to hold construction state. Every other keyword is optional and
+    forwarded to `create_app` unchanged — `gate_keeper`/`required_permission`/
+    `require_auth` for auth, `task_store`/`push_*` for durability, `middleware`/
+    `extra_routes` for anything else mounted alongside; see create_app's
+    docstring for each. If registry_url is given, self-registers {name,
+    description, agent_card_url} and heartbeats.
 
-    mode=DISCOVERY: `handler`/`on_cancel`/registry_url are ignored (a registry
-    node doesn't self-register); pass `registry` to inject a non-default
-    AgentRegistryPort.
+    mode=DISCOVERY: `handler`/`on_cancel`/registry_url/`message_id_generator`
+    are ignored (a registry node doesn't self-register or run any handler);
+    pass `registry` to inject a non-default AgentRegistryPort,
+    `context_builder` still applies.
     """
-    agent_card = card.to_agent_card()
     if mode == ServerMode.DISCOVERY:
-        app = create_app(mode=mode, agent_card=agent_card, registry=registry)
+        app = create_app(mode=mode, agent_card=card, registry=registry, context_builder=context_builder)
         serve(app, host=card.host, port=card.port)
         return
 
@@ -267,8 +416,18 @@ def serve_as_a2a(
         mode=mode,
         handler=handler,
         on_cancel=on_cancel,
-        agent_card=agent_card,
+        agent_card=card,
         registry_url=registry_url,
         registration_payload=registration_payload,
+        context_builder=context_builder,
+        message_id_generator=message_id_generator,
+        gate_keeper=gate_keeper,
+        required_permission=required_permission,
+        require_auth=require_auth,
+        task_store=task_store,
+        push_config_store=push_config_store,
+        push_sender=push_sender,
+        middleware=middleware,
+        extra_routes=extra_routes,
     )
     serve(app, host=card.host, port=card.port)

@@ -12,17 +12,42 @@ dependencies = []
 
 [project.optional-dependencies]
 server = [
-    "a2a-sdk[http-server]",
+    # Pinned to the 1.1.x line: 1.1.0 replaced DefaultRequestHandler with the
+    # ActiveTask-based V2 implementation and turned EventQueue into an ABC.
+    # tests/test_sdk_contract.py asserts the specific surface we build on, so
+    # an upgrade past this range fails there first rather than in production.
+    "a2a-sdk[http-server]>=1.1.2,<2",
     "uvicorn",
     "pydantic",
     "pydantic-settings",
     "httpx",
 ]
 client = [
-    "a2a-sdk",
+    "a2a-sdk>=1.1.2,<2",
     "httpx",
     "pydantic",
+]
+# JWT verification for the default GateKeeper. Separate because a deployment
+# behind an authenticating gateway, or using mTLS, never calls it and
+# shouldn't carry a crypto stack for it.
+auth = [
+    "pyjwt[crypto]>=2.8",
+]
+# Mounting an agent onto an existing FastAPI app (a2a_utility.server.fastapi).
+fastapi = [
+    "fastapi",
+]
+test = [
+    "a2a-sdk[http-server]>=1.1.2,<2",
+    "pydantic",
+    "pydantic-settings",
+    "pytest",
+    "pytest-asyncio",
 ]
 
 [tool.setuptools.packages.find]
 include = ["a2a_utility*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

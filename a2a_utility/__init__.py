@@ -1,11 +1,128 @@
-"""a2a_utility — shared A2A library: server-side and client-side, kept as two
-independent subpackages so importing one doesn't drag in the other's deps
-(server needs starlette/uvicorn/a2a-sdk's server extras; client only needs
-httpx).
+"""a2a_utility — the internal A2A library.
 
-    from a2a_utility.server import serve_as_a2a, run_discovery_server
-    from a2a_utility.client import call_agent, DiscoveryClient
+Everything an agent developer needs is reachable from here; nothing requires
+importing `a2a.*` directly. The native SDK is a dependency of this package,
+not of the code you write against it.
 
-See a2a_utility/server/README.md and this package's own README.md for the
-full architecture writeup and usage examples.
+    from a2a_utility import serve_as_a2a, ExtendedAgentCard, ExtendedPart
+
+Three subpackages, with a one-way dependency direction:
+
+    schema/     the typed data contract, shared by both sides
+    server/     stand up an A2A endpoint (AGENT node / DISCOVERY node)
+    client/     call an A2A endpoint
+
+`server` and `client` don't depend on each other — only on `schema` — so
+`pip install a2a-utility[server]` doesn't drag in the client's dependencies
+and vice versa. That isolation is why the names below are resolved lazily
+through `__getattr__` instead of imported eagerly: touching
+`a2a_utility.serve_as_a2a` imports the server subpackage at that moment, and
+a client-only process that never touches a server name never pays for (or
+requires) the server extras. Eager re-exports here would break exactly the
+split the three-subpackage layout exists to preserve.
+
+`schema` names are always safe to import — both extras include it.
+
+See README.md for usage and docs/DESIGN.md for the design rationale.
 """
+
+from typing import Any
+
+from .schema import (
+    A2ATaskResult,
+    CustomizedData,
+    ExtendedArtifact,
+    ExtendedMessage,
+    ExtendedPart,
+    ExtendedTask,
+    ExtendedTaskState,
+    MessageRole,
+    PartEmitter,
+    SourceReferenceResponse,
+    VercelThinkingResponse,
+    as_thinking_emitter,
+)
+
+__version__ = "0.1.0"
+
+# name -> submodule it lives in. Resolved on first attribute access.
+_LAZY: dict[str, str] = {
+    # --- server ---
+    "A2ASettings": "server",
+    "AgentHandlerPort": "server",
+    "ExtendedAgentCard": "server",
+    "ExtendedAgentProvider": "server",
+    "ExtendedAgentSkill": "server",
+    "ExtendedEventQueue": "server",
+    "ExtendedRequestContext": "server",
+    "ExtendedTaskUpdater": "server",
+    "OnCancelPort": "server",
+    "ServerMode": "server",
+    "add_to_fastapi": "server",
+    "create_app": "server",
+    "run_agent_server": "server",
+    "run_discovery_server": "server",
+    "serve": "server",
+    "serve_as_a2a": "server",
+    # --- server: auth ---
+    "AllowAllGateKeeper": "server",
+    "ApiKeyAuth": "server",
+    "BearerAuth": "server",
+    "CachedPermissionService": "server",
+    "ClaimNames": "server",
+    "GateKeeper": "server",
+    "GateKeeperPort": "server",
+    "GateMiddleware": "server",
+    "HttpPermissionService": "server",
+    "InvalidToken": "server",
+    "PermissionDenied": "server",
+    "PermissionServicePort": "server",
+    "TokenVerifierPort": "server",
+    "UserContext": "server",
+    # --- client ---
+    "A2ACallError": "client",
+    "CredentialProvider": "client",
+    "Credentials": "client",
+    "DiscoveryClient": "client",
+    "ExtendedAgentClient": "client",
+    "StaticToken": "client",
+    "call_agent": "client",
+    "call_agent_parts": "client",
+    "call_agent_result": "client",
+}
+
+__all__ = [
+    "__version__",
+    # schema (eager — no extra-specific dependencies)
+    "A2ATaskResult",
+    "CustomizedData",
+    "ExtendedArtifact",
+    "ExtendedMessage",
+    "ExtendedPart",
+    "ExtendedTask",
+    "ExtendedTaskState",
+    "MessageRole",
+    "PartEmitter",
+    "SourceReferenceResponse",
+    "VercelThinkingResponse",
+    "as_thinking_emitter",
+    *sorted(_LAZY),
+]
+
+
+def __getattr__(name: str) -> Any:
+    """Resolves a server/client name by importing its subpackage on demand."""
+    module_name = _LAZY.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    import importlib
+
+    module = importlib.import_module(f".{module_name}", __name__)
+    value = getattr(module, name)
+    globals()[name] = value  # cache, so this runs once per name
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(__all__)

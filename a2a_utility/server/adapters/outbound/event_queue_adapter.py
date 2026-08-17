@@ -1,137 +1,125 @@
-"""ExtendedEventQueue — the outbound adapter over the native a2a EventQueue.
+"""ExtendedEventQueue — thin typed wrapper over the native a2a EventQueue.
 
-`adapters/inbound/agent_executor.py` builds one per request and hands its
-`.emit` method to the injected AgentHandlerPort as the streaming callback —
-that's the entire "callback the domain agent gets" story, no separate port
-type needed here. Wraps a native a2a TaskUpdater:
+Exposes two methods. `enqueue_message` is the one a handler should reach
+for: it publishes a standalone `ExtendedMessage` — native's other "immediate
+response" workflow, replying without ever creating a `Task` at all, something
+`ExtendedTaskUpdater` structurally cannot do since it's built entirely around
+a Task's lifecycle. It takes and needs nothing from `a2a.*`.
 
-  - start_work()      -> the initial Task + a WORKING status
-  - emit(part)        -> a live WORKING status message carrying this part's
-    protobuf form (not text-only — an ExtendedPart can be thinking, a source
-    reference, a file, anything). This bound method IS the callback handed to
-    a domain agent's handler; the same ExtendedPart vocabulary streams live
-    here and gets returned in the final `list[ExtendedPart]`.
-  - complete(parts)   -> add parts as the final Artifact then COMPLETED, with
-    NO trailing status message (so the artifact stays the unambiguous answer)
-  - failed(text)      -> FAILED status
-  - requires_input(text) -> INPUT_REQUIRED status (task pauses; framework
-    re-invokes execute() when the follow-up arrives)
-  - requires_auth(text)  -> AUTH_REQUIRED status
-  - cancel(text)      -> CANCELED status (agent-initiated, from a
-    HandlerCanceled return value, or from AgentExecutor.cancel() reacting to
-    an externally-requested cancellation)
+`enqueue_event` is the advanced escape hatch underneath it, mirroring the
+native `a2a.server.events.EventQueue` ABC directly — whose own docstring
+explains why it's a single method: "Producer-side interface passed to
+`AgentExecutor.execute`/`cancel`. Exposes only `enqueue_event`. The consumer
+is framework-managed and not part of the public surface." It takes a raw
+native `Event`, so using it means building or holding an `a2a.types` object
+yourself — reasonable for code that already has one (this class's own
+`enqueue_message`, or `ExtendedTaskUpdater`), not the first thing a handler
+should reach for.
 
-No separate outbound Port/Protocol is defined for this (unlike
-AgentRegistryPort) — there's exactly one implementation and no anticipated
-alternative, so a Protocol here would be ceremony without payoff.
+An earlier version of this class also re-exported `dequeue_event`/`tap`/
+`close`/`task_done`/`is_closed` for "full 1:1 parity". Those exist on the
+concrete implementations (`EventQueueSource`/`EventQueueSink`), not on the
+interface the framework hands an executor, and handing them to a domain
+agent is actively harmful — a handler calling `close()` tears down the
+stream the framework is still consuming from, and `dequeue_event()` steals
+events from the framework's own consumer. Parity with the *interface* is the
+real parity; parity with an implementation detail is a footgun.
 
-Protocol rule (enforced by the a2a stream): a Task event MUST be enqueued before
-any TaskStatusUpdateEvent/TaskArtifactUpdateEvent. This class enqueues the Task
-lazily on the first emit, so the agent never has to think about it.
+Task-id validation, traced against actual native behavior: an event carrying
+a `task_id` that doesn't match the one the framework assigned for this
+request is rejected by `a2a.server.tasks.task_manager.TaskManager.
+save_task_event()`. That rejection happens on the framework's own
+event-processing path, not inside the coroutine running the handler, so
+nothing in `AgentExecutor` can catch it. This class runs the same check
+earlier — inside the handler's own coroutine, where a plain `ValueError` is
+trivially catchable.
+
+The check only applies to events that actually carry a task id. A standalone
+`Message` published through native's message-mode workflow legitimately
+leaves `task_id` empty (proto3 default `""`), and the framework's
+`EventConsumer._handle_message_event` accepts it as-is; validating it against
+this request's task id would reject the exact workflow `enqueue_message`
+exists to make reachable.
+
+No `.native` escape hatch: the raw native `EventQueue` is never reachable
+from domain-agent code, by design (see `application/dtos.py` and
+`agent_handler_port.py` for the full "domain agent never touches a2a.*"
+boundary this is part of).
 """
 
 from __future__ import annotations
 
 from typing import Optional
 
-from a2a.helpers import new_task_from_user_message, new_text_message
-from a2a.server.agent_execution import RequestContext
-from a2a.server.events import EventQueue
-from a2a.server.tasks import TaskUpdater
-from a2a.types import TaskState
+from a2a.server.events import Event, EventQueue
+from a2a.types import Task
 
-from ....schema import ExtendedPart
+from ....schema import ExtendedMessage
+
+__all__ = ["ExtendedEventQueue"]
 
 
-def _require_part(part: object) -> None:
-    if not isinstance(part, ExtendedPart):
-        raise TypeError(
-            f"ExtendedEventQueue expected an ExtendedPart, got {type(part).__name__}. "
-            "Build parts with a2a_utility.schema.ExtendedPart (from_text/thinking/"
-            "source_reference/file) — raw dicts/protos are rejected here so a "
-            "wrongly-typed value fails at the source instead of silently reaching "
-            "the native queue and blowing up downstream."
-        )
+def _event_task_id(event: Event) -> Optional[str]:
+    """The task id an event carries, or None if it carries none.
+
+    A `Task` names itself with `id`; the other three event types use
+    `task_id`. Proto3 scalars have no presence, so an unset id reads as `""`
+    — normalized to None here so callers can't confuse "no task id" with a
+    task literally identified by the empty string.
+    """
+    raw = event.id if isinstance(event, Task) else event.task_id
+    return raw or None
 
 
 class ExtendedEventQueue:
-    def __init__(self, context: RequestContext, event_queue: EventQueue) -> None:
-        task = context.current_task
-        if task is None:
-            task = new_task_from_user_message(context.message)
-        self._task = task
-        self._event_queue = event_queue
-        self._u = TaskUpdater(event_queue, task.id, task.context_id)
-        self._task_enqueued = False
+    def __init__(self, event_queue: EventQueue, *, expected_task_id: Optional[str] = None) -> None:
+        self._eq = event_queue  # private — no public accessor to the raw native queue
+        self._expected_task_id = expected_task_id
 
-    @property
-    def native(self) -> EventQueue:
-        """Escape hatch to the raw native EventQueue, for anything not wrapped here."""
-        return self._event_queue
+    async def enqueue_message(self, message: ExtendedMessage) -> None:
+        """Publishes a standalone reply — native's message-mode workflow.
 
-    async def _ensure_task(self) -> None:
-        # The stream requires a Task event before any status/artifact event.
-        if not self._task_enqueued:
-            await self._event_queue.enqueue_event(self._task)
-            self._task_enqueued = True
+        The typed, no-`a2a.*` way to answer without ever creating a `Task`.
+        Converts to the native protobuf `Message` internally and runs it
+        through the same task-id validation as `enqueue_event`.
 
-    async def start_work(self, note: str = "Processing request...") -> None:
-        await self._ensure_task()
-        await self._u.update_status(
-            state=TaskState.TASK_STATE_WORKING, message=new_text_message(note)
-        )
-
-    async def emit(self, part: ExtendedPart) -> None:
-        """Stream one live part (WORKING status message carrying this part).
-
-        Pass this bound method directly as the PartEmitter callback into a
-        domain agent's own business logic, or wrap it with
-        `a2a_utility.schema.as_thinking_emitter()` for code that only ever
-        streams plain thinking text.
+        Raises:
+            ValueError: `message.task_id` is set and doesn't match this
+                request's task_id. Leaving `task_id` unset is the normal case
+                for a fresh message-mode reply and is never checked.
         """
-        _require_part(part)
-        await self._ensure_task()
-        await self._u.update_status(
-            state=TaskState.TASK_STATE_WORKING,
-            message=self._u.new_agent_message([part.to_protobuf()]),
-        )
+        await self.enqueue_event(message.to_protobuf())
 
-    async def add_artifact(
-        self, parts: list[ExtendedPart], *, name: Optional[str] = None
-    ) -> None:
-        for part in parts:
-            _require_part(part)
-        await self._ensure_task()
-        await self._u.add_artifact(parts=[p.to_protobuf() for p in parts], name=name)
+    async def enqueue_event(self, event: Event) -> None:
+        """Publishes any native Event — the advanced escape hatch.
 
-    async def complete(
-        self, parts: Optional[list[ExtendedPart]] = None, *, name: Optional[str] = None
-    ) -> None:
-        await self._ensure_task()
-        if parts:
-            await self.add_artifact(parts, name=name)
-        # No message on COMPLETED — keeps the artifact the unambiguous final answer.
-        await self._u.update_status(state=TaskState.TASK_STATE_COMPLETED)
+        Most handlers want `enqueue_message` instead: it takes an
+        `ExtendedMessage`, converts internally, and needs no `a2a.*` import.
+        Reach for this one directly only when you already hold a native
+        `Task`/`TaskStatusUpdateEvent`/`TaskArtifactUpdateEvent` — which
+        `ExtendedTaskUpdater` already builds and publishes correctly, so
+        there is rarely a reason to call this with one of those yourself.
 
-    async def failed(self, text: str) -> None:
-        await self._ensure_task()
-        await self._u.update_status(
-            state=TaskState.TASK_STATE_FAILED, message=new_text_message(text)
-        )
-
-    async def requires_input(self, text: str) -> None:
-        await self._ensure_task()
-        await self._u.update_status(
-            state=TaskState.TASK_STATE_INPUT_REQUIRED, message=new_text_message(text)
-        )
-
-    async def requires_auth(self, text: str) -> None:
-        await self._ensure_task()
-        await self._u.update_status(
-            state=TaskState.TASK_STATE_AUTH_REQUIRED, message=new_text_message(text)
-        )
-
-    async def cancel(self, text: Optional[str] = None) -> None:
-        await self._ensure_task()
-        message = new_text_message(text) if text else None
-        await self._u.update_status(state=TaskState.TASK_STATE_CANCELED, message=message)
+        Raises:
+            ValueError: the event carries a task_id that isn't this request's.
+                Native would reject the same event deep inside its own
+                event-processing path, outside any exception handler reachable
+                from the handler; raising here keeps it catchable.
+        """
+        event_task_id = _event_task_id(event)
+        if (
+            self._expected_task_id is not None
+            and event_task_id is not None
+            and event_task_id != self._expected_task_id
+        ):
+            raise ValueError(
+                f"enqueue_event: event's task_id {event_task_id!r} doesn't match "
+                f"this request's task_id {self._expected_task_id!r}. Native would "
+                "reject this deep inside its own event-processing path — outside "
+                "any exception handler here — so it's checked eagerly instead. "
+                "For Task/TaskStatusUpdateEvent/TaskArtifactUpdateEvent, prefer "
+                "ExtendedTaskUpdater, which already gets this right. A standalone "
+                "Message with no task_id at all is fine and is not checked — "
+                "prefer enqueue_message() for that case."
+            )
+        await self._eq.enqueue_event(event)

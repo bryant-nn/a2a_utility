@@ -1,13 +1,23 @@
-"""Inbound adapter: builds the Principal a request carries.
+"""Inbound adapter: assembling the per-request ServerCallContext.
 
-a2a threads per-request identity through context.call_context (a ServerCallContext
-with a typed User + an arbitrary `state` dict). The sanctioned extension point is a
-custom ServerCallContextBuilder passed to create_jsonrpc_routes(..., context_builder=).
+a2a threads per-request state through `context.call_context`, and the
+sanctioned extension point is a custom `ServerCallContextBuilder` passed to
+`create_jsonrpc_routes(..., context_builder=)`. This is a2a_utility's.
 
-This builds a typed `Principal` from the incoming request and writes it into
-call_context.state via domain/models/principal.py's write_principal() — the
-header parsing here is a STUB, a real deployment validates a JWT / session
-instead. This is the single place to do that.
+It deliberately does very little. An earlier version parsed headers into a
+`Principal` here, which put identity construction in the wrong place: a
+context builder can only return a context or raise, and raising surfaces as a
+JSON-RPC internal error — so authentication failures came out as opaque 500s
+instead of something an A2A caller could act on. Identity now belongs to the
+`GateKeeper`, which runs inside `AgentExecutor.execute()` where a refusal can
+become a `REJECTED`/`AUTH_REQUIRED` *task state*.
+
+What remains is making sure the raw headers reach the gate.
+`DefaultServerCallContextBuilder` already puts them in `state['headers']`
+(asserted by `tests/test_sdk_contract.py`), so this subclass exists mainly as
+a named, stable extension point: override `build()` to attach anything else
+your deployment wants on every request — a trace id, a tenant resolved from
+the hostname — without forking this package.
 """
 
 from __future__ import annotations
@@ -17,36 +27,24 @@ from a2a.server.context import ServerCallContext
 from a2a.server.routes.common import DefaultServerCallContextBuilder
 from starlette.requests import Request
 
-from ...domain.models.principal import Principal, read_principal, write_principal
+from ...domain.models.user_context import UserContext, read_user_context
+
+__all__ = ["A2AUtilityCallContextBuilder", "get_user_context"]
 
 
 class A2AUtilityCallContextBuilder(DefaultServerCallContextBuilder):
-    """Builds the native ServerCallContext, then attaches a typed Principal.
-
-    Override `build_principal` to plug in real auth (JWT/session validation).
-    """
+    """The default context builder. Adds nothing to native's behavior yet;
+    it is the seam to add to."""
 
     def build(self, request: Request) -> ServerCallContext:
-        ctx = super().build(request)
-        write_principal(ctx.state, self.build_principal(request, ctx))
-        return ctx
-
-    def build_principal(self, request: Request, ctx: ServerCallContext) -> Principal:
-        headers = {k.lower(): v for k, v in dict(ctx.state.get("headers", {})).items()}
-        auth = headers.get("authorization", "")
-        token = auth[len("Bearer "):].strip() if auth.lower().startswith("bearer ") else None
-        roles = [r for r in headers.get("x-user-roles", "").split(",") if r]
-        return Principal(
-            user_id=headers.get("x-user-id"),
-            roles=roles,
-            tenant_id=ctx.tenant or headers.get("x-tenant-id"),
-            token=token,
-        )
+        return super().build(request)
 
 
-def get_principal(context: RequestContext) -> Principal:
-    """Escape hatch for code holding a native RequestContext directly (not
-    wrapped in ExtendedRequestContext). ExtendedRequestContext.principal reads
-    domain/models/principal.py's read_principal() directly instead of this,
-    to keep the application layer from depending on the adapters layer."""
-    return read_principal(context.call_context.state)
+def get_user_context(context: RequestContext) -> UserContext:
+    """The caller identity, for code holding a *native* RequestContext.
+
+    Handlers should use `ExtendedRequestContext.user` instead — this exists
+    for code sitting outside the handler boundary, such as a custom
+    `AgentExecutor` or a native-typed middleware.
+    """
+    return read_user_context(context.call_context.state)

@@ -33,10 +33,11 @@ and "here are the final parts."
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any, Awaitable, Callable, Literal, Optional, Union
 
 from a2a.helpers import new_data_part, new_raw_part, new_text_part, new_url_part
-from a2a.types import Artifact, Message, Part
+from a2a.types import Artifact, Message, Part, Role
 from google.protobuf.json_format import MessageToDict
 from pydantic import BaseModel, Field, model_validator
 
@@ -91,12 +92,24 @@ class ExtendedPart(BaseModel):
         return self
 
     # ---- ergonomic constructors ----
+    # `media_type` is keyword-only and explicit on every constructor: it maps
+    # to the native Part's own `media_type` field, NOT into `metadata`. Left
+    # to **metadata it would silently land in the Struct instead, producing a
+    # part that looks right locally and reads wrong on the wire.
     @classmethod
-    def from_text(cls, text: str, **metadata: Any) -> "ExtendedPart":
-        return cls(text=text, metadata=metadata or None)
+    def from_text(
+        cls, text: str, *, media_type: Optional[str] = None, **metadata: Any
+    ) -> "ExtendedPart":
+        return cls(text=text, media_type=media_type, metadata=metadata or None)
 
     @classmethod
-    def thinking(cls, text_or_model: "str | VercelThinkingResponse", **metadata: Any) -> "ExtendedPart":
+    def thinking(
+        cls,
+        text_or_model: "str | VercelThinkingResponse",
+        *,
+        media_type: Optional[str] = None,
+        **metadata: Any,
+    ) -> "ExtendedPart":
         inner = (
             text_or_model
             if isinstance(text_or_model, VercelThinkingResponse)
@@ -104,12 +117,17 @@ class ExtendedPart(BaseModel):
         )
         return cls(
             data=CustomizedData(data_type="thinking_response", data_content=inner),
+            media_type=media_type,
             metadata=metadata or None,
         )
 
     @classmethod
     def source_reference(
-        cls, refs_or_model: "list | SourceReferenceResponse", **metadata: Any
+        cls,
+        refs_or_model: "list | SourceReferenceResponse",
+        *,
+        media_type: Optional[str] = None,
+        **metadata: Any,
     ) -> "ExtendedPart":
         inner = (
             refs_or_model
@@ -118,6 +136,7 @@ class ExtendedPart(BaseModel):
         )
         return cls(
             data=CustomizedData(data_type="source_reference_response", data_content=inner),
+            media_type=media_type,
             metadata=metadata or None,
         )
 
@@ -224,15 +243,80 @@ class ExtendedArtifact(BaseModel):
         return [p.to_protobuf() for p in self.parts]
 
 
+class MessageRole(str, Enum):
+    """Native `Role` is a protobuf enum (bare ints); this mirrors it as
+    strings for the same reason ExtendedTaskState mirrors TaskState."""
+
+    USER = "user"
+    AGENT = "agent"
+    UNSPECIFIED = "unspecified"
+
+    def to_proto(self) -> int:
+        return {
+            MessageRole.USER: Role.ROLE_USER,
+            MessageRole.AGENT: Role.ROLE_AGENT,
+            MessageRole.UNSPECIFIED: Role.ROLE_UNSPECIFIED,
+        }[self]
+
+    @classmethod
+    def from_proto(cls, role: int) -> "MessageRole":
+        return {
+            Role.ROLE_USER: cls.USER,
+            Role.ROLE_AGENT: cls.AGENT,
+        }.get(role, cls.UNSPECIFIED)
+
+
 class ExtendedMessage(BaseModel):
-    role: str
+    """A message on the A2A wire — the incoming user turn, or an agent reply.
+
+    Converts both ways. `to_protobuf()` exists so this type can be an *input*
+    as well as a read model: `ExtendedTaskUpdater.complete(message=...)` and
+    friends take one of these, and message-mode replies are published as one.
+    Without it a handler wanting to attach a message to a status update would
+    have to build a native `a2a.types.Message` by hand.
+
+    `message_id` is optional here and generated at the boundary when absent —
+    `ExtendedTaskUpdater.new_agent_message()` fills it from the updater's own
+    ID generator, so a handler never has to invent one.
+    """
+
+    role: MessageRole = MessageRole.AGENT
     parts: list[ExtendedPart] = Field(default_factory=list)
+    message_id: Optional[str] = None
+    task_id: Optional[str] = None
+    context_id: Optional[str] = None
+    metadata: Optional[dict] = None
 
     @classmethod
     def from_protobuf(cls, proto: Message) -> "ExtendedMessage":
-        from a2a.types import Role
-
         return cls(
-            role=Role.Name(proto.role),
+            role=MessageRole.from_proto(proto.role),
             parts=[ExtendedPart.from_protobuf(p) for p in proto.parts],
+            # proto3 scalars have no presence; "" means absent.
+            message_id=proto.message_id or None,
+            task_id=proto.task_id or None,
+            context_id=proto.context_id or None,
+            metadata=MessageToDict(proto.metadata) if proto.HasField("metadata") else None,
         )
+
+    def to_protobuf(self) -> Message:
+        message = Message(
+            role=self.role.to_proto(),
+            parts=[p.to_protobuf() for p in self.parts],
+        )
+        # Assigned individually rather than in the constructor: passing None
+        # for a proto3 string field raises, and "" would be indistinguishable
+        # from a deliberately-empty id downstream.
+        if self.message_id is not None:
+            message.message_id = self.message_id
+        if self.task_id is not None:
+            message.task_id = self.task_id
+        if self.context_id is not None:
+            message.context_id = self.context_id
+        if self.metadata:
+            message.metadata.update(self.metadata)
+        return message
+
+    def text(self, delimiter: str = "\n") -> str:
+        """The concatenated text parts — the plain-language content."""
+        return delimiter.join(p.text for p in self.parts if p.text is not None)
