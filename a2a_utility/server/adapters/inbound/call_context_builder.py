@@ -1,17 +1,21 @@
 """Inbound adapter: assembling the per-request ServerCallContext.
 
-a2a threads per-request state through `context.call_context`, and the
-sanctioned extension point is a custom `ServerCallContextBuilder` passed to
-`create_jsonrpc_routes(..., context_builder=)`. This is a2a_utility's.
+a2a threads per-request state through `context.call_context`, built by a
+`ServerCallContextBuilder` passed to `create_jsonrpc_routes(...,
+context_builder=)`. This is a2a_utility's, and `create_app()` always uses
+it — it is not an injection point on that function.
 
-It deliberately does very little — this is a named, stable seam to extend,
-not somewhere logic already lives. `DefaultServerCallContextBuilder` already
-puts the raw request headers in `state['headers']` (asserted by
-`tests/test_sdk_contract.py`), so a deployment wanting to attach anything
-else to every request — a trace id, a tenant resolved from the hostname,
-identity parsed from a credential — overrides `build()` in a subclass and
-passes it via `context_builder=` on `create_app()`/`serve_as_a2a()`, without
-forking this package.
+It deliberately does very little; it exists as a named place for this
+concern rather than an anonymous native default buried in the composition
+root. `DefaultServerCallContextBuilder` already puts the raw request headers
+in `state['headers']` (asserted by `tests/test_sdk_contract.py`).
+
+A deployment that needs to attach something else to every request — a trace
+id, a tenant resolved from the hostname, identity parsed from a credential —
+subclasses this and composes its own app from the exported `AgentExecutor`
+and native `DefaultRequestHandler`, passing the subclass to
+`create_jsonrpc_routes()` directly. `create_app()` is the short path, not the
+configurable one.
 """
 
 from __future__ import annotations

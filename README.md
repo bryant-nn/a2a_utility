@@ -153,17 +153,43 @@ if result.status == ExtendedTaskState.INPUT_REQUIRED:
 
 ## 上線相關
 
+`create_app()` / `serve_as_a2a()` **刻意不收任何 production 注入參數**，只有 `mode` / `agent_card` /
+`handler` / `on_cancel` / `registry_url` / `registration_payload` / `rpc_url`。需要更多的時候：
+
+**掛 middleware、加 route** —— `create_app()` 回傳的就是一個普通 Starlette app，用 Starlette 自己的 API：
+
 ```python
-create_app(
-    agent_card=card,
-    handler=handle,
-    task_store=DatabaseTaskStore(...),   # 預設 InMemoryTaskStore：重啟就掉、不能多副本共享
-    push_config_store=...,               # push notification（兩個都要給才會生效）
-    push_sender=...,
-    middleware=[Middleware(...)],        # 任意 Starlette middleware
-    extra_routes=[Route("/health", health)],
-)
+app = create_app(agent_card=card, handler=handle)
+app.add_middleware(MyMiddleware)
+app.router.routes.append(Route("/health", health))
+serve(app, host=card.host, port=card.port)
 ```
+
+（`serve_as_a2a()` 是「建 app + 跑起來」一步到位，中間沒有插手的機會 —— 要動 app 就拆成
+`create_app()` + `serve()` 兩步。）
+
+**durable task store、push notification、REST binding** —— 用公開的 `AgentExecutor` 自己組。這是刻意的
+取捨：`a2a_utility` 只保證最短路徑，複雜部署直接對原生：
+
+```python
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
+from a2a_utility.server import AgentExecutor, A2AUtilityCallContextBuilder
+
+proto_card = card.to_agent_card()
+request_handler = DefaultRequestHandler(
+    agent_executor=AgentExecutor(handler=handle),   # ← handler 合約完全不變
+    task_store=DatabaseTaskStore(...),
+    agent_card=proto_card,
+    push_config_store=..., push_sender=...,
+)
+routes = [*create_agent_card_routes(proto_card),
+          *create_jsonrpc_routes(request_handler, "/",
+                                 context_builder=A2AUtilityCallContextBuilder())]
+app = Starlette(routes=routes)   # lifespan 記得接 request_handler.aclose()
+```
+
+domain agent 那支 `handle()` 一個字都不用改 —— 換掉的只有組 app 這層。
 
 ---
 
@@ -210,6 +236,8 @@ pytest
 
 ## 已知限制
 
+- **`create_app()` 的 task store 寫死 `InMemoryTaskStore`**：重啟就掉、不能多副本共享。要 durable 的
+  就照「上線相關」那段自己組 app。
 - **Registry 是單一行程、純記憶體**：沒有持久化、沒有多副本。要給多團隊共用的話這是第一個要處理的。
 - **DISCOVERY 的 `/register` 是手刻解析**，錯誤訊息只有一個手寫的 400。
 - **`DiscoveryClient.search()` 沒有實際呼叫端**：`rank_agents()` 已經可用，但兩個 coordinator demo

@@ -83,19 +83,18 @@ Public surface:
                    ExtendedTask, ExtendedTaskState, A2ATaskResult,
                    VercelThinkingResponse, SourceReferenceResponse, CustomizedData,
                    PartEmitter, as_thinking_emitter (re-exported from a2a_utility.schema)
-  - Context builder: A2AUtilityCallContextBuilder — the sanctioned extension
-                   point for attaching anything to a request's call_context;
-                   see that module's docstring.
+  - Context builder: A2AUtilityCallContextBuilder — the builder `create_app`
+                   always uses; subclass it only when composing your own app
+                   (see that module's docstring).
   - Standalone:    run_agent_server, run_discovery_server, ServerMode, A2ASettings
-  - Native re-exports: IDGenerator, ServerCallContextBuilder — the two types a
-                   caller needs to *name* in order to pass `message_id_generator=`
-                   or subclass `context_builder=`. Nothing else native is
-                   re-exported: `RequestContext`/`EventQueue` used to be, which
-                   quietly told handlers the protobuf types were fair game.
+  - Native re-exports: IDGenerator — the one type a caller needs to *name* in
+                   order to pass `message_id_generator=` to `ExtendedTaskUpdater`
+                   or `AgentExecutor`. Nothing else native is re-exported:
+                   `RequestContext`/`EventQueue` used to be, which quietly told
+                   handlers the protobuf types were fair game.
 """
 
 from a2a.server.id_generator import IDGenerator
-from a2a.server.routes.common import ServerCallContextBuilder
 
 from .adapters.inbound.agent_executor import AgentExecutor
 from .adapters.inbound.call_context_builder import A2AUtilityCallContextBuilder
@@ -159,9 +158,9 @@ __all__ = [
     "run_discovery_server",
     "ServerMode",
     "A2ASettings",
-    # advanced: composing your own Starlette app instead of create_app()
+    # advanced: composing your own Starlette app instead of create_app() —
+    # the path for a durable task store, push notifications, or REST routes
     "AgentExecutor",
-    # native re-exports, for typing a custom context_builder=/message_id_generator=
+    # native re-export, for typing a custom message_id_generator=
     "IDGenerator",
-    "ServerCallContextBuilder",
 ]
