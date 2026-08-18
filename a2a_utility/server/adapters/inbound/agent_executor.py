@@ -60,7 +60,6 @@ domain agents to exactly the same expectation, no more, no less.
 from __future__ import annotations
 
 import contextlib
-import logging
 from typing import Optional
 
 from a2a.server.agent_execution import AgentExecutor as _NativeAgentExecutor
@@ -70,14 +69,9 @@ from a2a.server.id_generator import IDGenerator
 
 from ...application.dtos import ExtendedRequestContext
 from ...application.ports.inbound.agent_handler_port import AgentHandlerPort
-from ...application.ports.inbound.gate_keeper_port import GateKeeperPort
 from ...application.ports.inbound.on_cancel_port import OnCancelPort
-from ...domain.models.auth_decision import Allow, AuthRequired, Reject
-from ...domain.models.user_context import PermissionDenied
 from ..outbound.event_queue_adapter import ExtendedEventQueue
 from ..outbound.task_updater_adapter import ExtendedTaskUpdater
-
-logger = logging.getLogger(__name__)
 
 
 class AgentExecutor(_NativeAgentExecutor):
@@ -86,76 +80,24 @@ class AgentExecutor(_NativeAgentExecutor):
         handler: AgentHandlerPort,
         on_cancel: Optional[OnCancelPort] = None,
         *,
-        gate_keeper: Optional[GateKeeperPort] = None,
-        required_permission: Optional[str] = None,
         message_id_generator: Optional[IDGenerator] = None,
     ) -> None:
         self._handler = handler
         self._on_cancel = on_cancel
-        self._gate_keeper = gate_keeper
-        self._required_permission = required_permission
         self._message_id_generator = message_id_generator
 
     def _build_event_queue(self, context: RequestContext, event_queue: EventQueue) -> ExtendedEventQueue:
         return ExtendedEventQueue(event_queue, expected_task_id=context.task_id)
 
-    def _task_updater(
-        self, ctx: ExtendedRequestContext, eq: ExtendedEventQueue
-    ) -> ExtendedTaskUpdater:
-        return ExtendedTaskUpdater(ctx, eq, message_id_generator=self._message_id_generator)
-
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         ctx = ExtendedRequestContext(context)
         eq = self._build_event_queue(context, event_queue)
         try:
-            if not await self._passes_gate(ctx, eq):
-                return
             await self._handler(ctx, eq)
-        except PermissionDenied as e:
-            # Distinct from a generic failure on purpose: "you may not" ends
-            # the task REJECTED, "it broke" ends it FAILED. A caller reads
-            # those differently — one is worth retrying with better
-            # credentials, the other isn't worth retrying at all.
-            logger.info("handler refused a tool-level permission: %s", e)
-            with contextlib.suppress(RuntimeError):
-                await self._task_updater(ctx, eq).reject(str(e))
         except Exception as e:
             with contextlib.suppress(RuntimeError):  # handler's own TaskUpdater may already be terminal
-                await self._task_updater(ctx, eq).failed(f"Agent error: {e}")
-
-    async def _passes_gate(
-        self, ctx: ExtendedRequestContext, eq: ExtendedEventQueue
-    ) -> bool:
-        """Runs the gate, ending the task itself if the answer is no.
-
-        Returns True when the handler should run. Deliberately inside
-        execute()'s scope rather than in a middleware: only here can a refusal
-        become a *task state* the A2A caller can interpret, instead of a bare
-        HTTP status.
-        """
-        if self._gate_keeper is None:
-            return True
-
-        headers = ctx.headers
-        decision = await self._gate_keeper.authorize(headers, self._required_permission)
-
-        if isinstance(decision, Allow):
-            ctx.attach_user(decision.user)
-            return True
-
-        task_updater = self._task_updater(ctx, eq)
-        if isinstance(decision, AuthRequired):
-            logger.info("gate: authentication required — %s", decision.reason)
-            await task_updater.requires_auth(decision.reason)
-        elif isinstance(decision, Reject):
-            logger.info("gate: rejected — %s", decision.reason)
-            await task_updater.reject(decision.reason)
-        else:  # pragma: no cover - a GateKeeperPort returning something else
-            raise TypeError(
-                f"gate_keeper.authorize returned {type(decision).__name__}; "
-                "expected Allow, AuthRequired, or Reject."
-            )
-        return False
+                tu = ExtendedTaskUpdater(ctx, eq, message_id_generator=self._message_id_generator)
+                await tu.failed(f"Agent error: {e}")
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         """Reacts to an externally-requested cancellation (a client's cancel

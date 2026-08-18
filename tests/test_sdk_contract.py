@@ -173,7 +173,7 @@ def test_task_state_still_has_every_state_ExtendedTaskState_maps():
 
 def test_default_context_builder_still_puts_raw_headers_in_state():
     """adapters/inbound/call_context_builder.py relies on `state['headers']`
-    being populated by the superclass — the GateKeeper reads the JWT from
-    there."""
+    being populated by the superclass — a custom context builder can read
+    them from there."""
     source = inspect.getsource(DefaultServerCallContextBuilder.build)
     assert "state['headers']" in source or 'state["headers"]' in source

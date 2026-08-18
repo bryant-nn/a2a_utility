@@ -11,7 +11,7 @@ import pytest
 from a2a_utility.client import A2ACallError, call_agent, call_agent_result
 from a2a_utility.schema import ExtendedPart, ExtendedTaskState
 
-from harness import BASE_URL, build_card, running_app
+from harness import BASE_URL, running_app
 
 
 async def test_normal_task_lifecycle_round_trips_every_part_type(make_app):
@@ -104,6 +104,62 @@ async def test_message_mode_reply_reaches_the_caller(make_app):
     assert not result.task_id
 
 
+async def test_input_required_resume_continues_the_same_task(make_app):
+    """A paused task only resumes if the caller resends the same task_id —
+    this is the client-side half of `context.is_resuming` ever being True.
+    Exercises `call_agent_result(..., task_id=...)` end to end: first call
+    pauses with INPUT_REQUIRED, second call (same task_id) completes it."""
+
+    async def handler(context, event_queue):
+        from a2a_utility.server import ExtendedTaskUpdater
+
+        tu = ExtendedTaskUpdater(context, event_queue)
+        await tu.start_work()
+        if not context.is_resuming:
+            await tu.requires_input("what city?")
+            return
+        city = context.get_user_input()
+        await tu.add_artifact([ExtendedPart.from_text(f"weather in {city}: sunny")])
+        await tu.complete()
+
+    async with running_app(make_app(handler)) as http:
+        first = await call_agent_result(BASE_URL, "book a flight", http_client=http)
+        assert first.status == ExtendedTaskState.INPUT_REQUIRED
+        assert first.task_id
+
+        second = await call_agent_result(
+            BASE_URL, "boston", http_client=http, task_id=first.task_id
+        )
+
+    assert second.status == ExtendedTaskState.COMPLETED
+    assert second.task_id == first.task_id
+    assert second.text() == "weather in boston: sunny"
+
+
+async def test_omitting_task_id_starts_a_fresh_task_even_after_a_pause(make_app):
+    """Without task_id=, every call is a brand new task to the server — the
+    absence of the resume mechanism, not just its presence, is worth
+    pinning down."""
+
+    async def handler(context, event_queue):
+        from a2a_utility.server import ExtendedTaskUpdater
+
+        tu = ExtendedTaskUpdater(context, event_queue)
+        await tu.start_work()
+        if not context.is_resuming:
+            await tu.requires_input("what city?")
+            return
+        await tu.complete("should not reach here")
+
+    async with running_app(make_app(handler)) as http:
+        first = await call_agent_result(BASE_URL, "book a flight", http_client=http)
+        second = await call_agent_result(BASE_URL, "boston", http_client=http)
+
+    assert first.status == ExtendedTaskState.INPUT_REQUIRED
+    assert second.status == ExtendedTaskState.INPUT_REQUIRED
+    assert second.task_id != first.task_id
+
+
 async def test_agent_card_is_served_at_the_well_known_path(make_app):
     async with running_app(make_app(lambda c, q: None)) as http:
         response = await http.get("/.well-known/agent-card.json")
@@ -112,22 +168,6 @@ async def test_agent_card_is_served_at_the_well_known_path(make_app):
     card = response.json()
     assert card["name"] == "test_agent"
     assert card["skills"][0]["id"] == "echo"
-
-
-async def test_declared_auth_scheme_appears_on_the_served_card(make_app):
-    """A native client's AuthInterceptor reads these off the card to decide
-    what credential to attach — if they don't serialize, no client ever
-    authenticates."""
-    from a2a_utility.server import BearerAuth
-
-    card = build_card()
-    card.auth = BearerAuth()
-
-    async with running_app(make_app(lambda c, q: None, card=card)) as http:
-        served = (await http.get("/.well-known/agent-card.json")).json()
-
-    assert "bearer" in served["securitySchemes"]
-    assert list(served["securityRequirements"][0]["schemes"]) == ["bearer"]
 
 
 async def test_shutdown_drains_the_request_handler(make_app):

@@ -1,35 +1,41 @@
 """Attaching credentials to outbound A2A calls.
 
-The other half of the gate. A server can verify all it likes, but if callers
-never send anything the only thing that changes is that nothing works — so
-this exists so a caller passes `credentials=` and stops thinking about it.
+A caller passes `credentials=` and stops thinking about it — the actual
+header (bearer vs. an API key under its own header name) is native's
+business, driven by whatever security scheme the *target* agent's card
+declares.
 
 Built on the native SDK's own auth machinery (`AuthInterceptor` +
-`CredentialService`) rather than a parallel implementation, so the mapping
-from a declared security scheme to a concrete header — bearer vs. an API key
-under its own header name — stays the SDK's business.
+`CredentialService`) rather than a parallel implementation, so that mapping
+stays the SDK's business when the target does declare a scheme.
 
-With one deliberate addition. Native's `AuthInterceptor` attaches nothing
-when the target's agent card declares no `security_schemes`: it iterates the
-card's requirements, and an empty list means an empty loop. That is a
+With one deliberate addition: native's `AuthInterceptor` attaches nothing
+when the target's agent card declares no `security_schemes` — it iterates
+the card's requirements, and an empty list means an empty loop. That is a
 reasonable protocol reading and a bad failure mode — a caller who passed a
 token gets a silent 401 from a server that does require one, because the two
-sides disagree about whether the card was filled in. `_A2AAuthInterceptor`
-therefore falls back to a plain `Authorization: Bearer` header when
+sides disagree about whether the card was filled in. It is also, against an
+a2a_utility-served agent, now the *only* case there is: `ExtendedAgentCard`
+has no way to declare a security scheme at all (a2a_utility's server has no
+built-in auth concept — see `server/README.md`). `_A2AAuthInterceptor`
+therefore falls back to a plain `Authorization: Bearer` header whenever
 credentials were supplied and the card declared nothing. Explicit
-declarations always win; the fallback only fills a vacuum.
+declarations always win when the target does have them; the fallback only
+fills a vacuum.
 
 Agent-to-agent forwarding
 -------------------------
-The common shape in a multi-agent system: a root agent authenticates a user,
-then calls domain agents on their behalf. The user's own token rides along:
+The common shape in a multi-agent system: something upstream authenticates a
+caller and forwards that identity to a downstream agent it calls on the
+caller's behalf:
 
-    answer = await call_agent(url, question, credentials=context.user.token)
+    answer = await call_agent(url, question, credentials=incoming_token)
 
-`context.user.token` is the raw verified credential the gate kept for exactly
-this. Note what this means — the downstream agent authorizes *the end user*,
-not the root agent — which is usually what you want, and always worth being
-deliberate about.
+Note what this means — the downstream agent authorizes *the original
+caller*, not whatever's calling it here — which is usually what you want,
+and always worth being deliberate about. What counts as "the incoming
+token" and how it was verified is entirely up to whatever sits in front of
+the caller; a2a_utility only carries it forward.
 """
 
 from __future__ import annotations

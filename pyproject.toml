@@ -27,16 +27,6 @@ client = [
     "httpx",
     "pydantic",
 ]
-# JWT verification for the default GateKeeper. Separate because a deployment
-# behind an authenticating gateway, or using mTLS, never calls it and
-# shouldn't carry a crypto stack for it.
-auth = [
-    "pyjwt[crypto]>=2.8",
-]
-# Mounting an agent onto an existing FastAPI app (a2a_utility.server.fastapi).
-fastapi = [
-    "fastapi",
-]
 test = [
     "a2a-sdk[http-server]>=1.1.2,<2",
     "pydantic",

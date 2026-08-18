@@ -67,9 +67,6 @@ def run_agent_server(settings: Optional[A2ASettings] = None) -> None:
         mode=ServerMode.AGENT,
         handler=_demo_handler,
         agent_card=_demo_card(settings, skill),
-        gate_keeper=settings.build_gate_keeper(),
-        required_permission=settings.required_permission,
-        require_auth=settings.require_auth,
     )
     serve(app, host=settings.host, port=settings.port)
 

@@ -1,89 +1,94 @@
-"""End-to-end credentials: `credentials=` on the client must satisfy the
-gate on the server.
+"""End-to-end: `credentials=` on the client actually puts an
+`Authorization` header on the wire.
 
-The two halves were built separately and each looks correct alone; this is
-the test that they meet. It exercises the real interceptor chain, the real
-HTTP headers, and the real gate.
+This used to be verified by checking that a server-side GateKeeper accepted
+the credential — but the server side no longer has any auth concept
+(GateKeeper, UserContext, and the card's `auth=` declaration were all
+removed). What's left to test is squarely a *client* behavior: does
+`credentials=`/`StaticToken`/a `CredentialProvider` really attach the header,
+and does `_A2AAuthInterceptor`'s fallback (attach a bearer header even when
+the target card declares no security scheme at all — which is now the only
+case there is, since a card can no longer declare one) actually fire.
+
+Verified by a plain Starlette middleware that records the `Authorization`
+header it sees on each request, independent of anything the handler does —
+decoupling "was the credential attached correctly" from "what does a server
+do with it", which is what this file should be testing.
 """
 
 from __future__ import annotations
 
-from a2a_utility.client import StaticToken, call_agent, call_agent_result
-from a2a_utility.schema import ExtendedPart, ExtendedTaskState
-from a2a_utility.server import BearerAuth, ExtendedTaskUpdater, GateKeeper, InvalidToken
+from starlette.middleware import Middleware
 
-from harness import BASE_URL, build_card, running_app
+from a2a_utility.client import StaticToken, call_agent
+
+from harness import BASE_URL, running_app
 
 GOOD_TOKEN = "good-token"
 
 
-class FakeVerifier:
-    async def verify(self, token: str) -> dict:
-        if token != GOOD_TOKEN:
-            raise InvalidToken("signature verification failed")
-        return {"sub": "alice", "tenant_id": "acme"}
+class _CaptureAuthorization:
+    """Records the `Authorization` header of every JSON-RPC call (POST /).
+
+    Not every request: `create_client()` fetches the agent card first with a
+    plain unauthenticated GET (interceptors only apply to the actual RPC
+    call), and capturing that too would make every test see an extra leading
+    `None` unrelated to what credentials= actually did.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+        self.seen: list[str | None] = []
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http" and scope.get("method") == "POST":
+            headers = dict(scope.get("headers") or [])
+            value = headers.get(b"authorization")
+            self.seen.append(value.decode() if value else None)
+        await self.app(scope, receive, send)
 
 
-class FakePermissions:
-    async def get_permissions(self, subject: str, tenant: str | None = None) -> set[str]:
-        return {"agent:test"}
+def capturing_app(make_app):
+    """A plain (ungated) app wrapped with a header-capturing middleware.
+    Returns (app, capture) — `capture.seen` fills in as requests arrive."""
+    capture_holder: dict[str, _CaptureAuthorization] = {}
+
+    def _capturing_middleware_factory(app):
+        instance = _CaptureAuthorization(app)
+        capture_holder["instance"] = instance
+        return instance
+
+    async def handler(context, event_queue):
+        from a2a_utility.server import ExtendedTaskUpdater
+        from a2a_utility.schema import ExtendedPart
+
+        tu = ExtendedTaskUpdater(context, event_queue)
+        await tu.start_work()
+        await tu.add_artifact([ExtendedPart.from_text("ok")])
+        await tu.complete()
+
+    app = make_app(handler, middleware=[Middleware(_capturing_middleware_factory)])
+    return app, capture_holder
 
 
-async def whoami(context, event_queue) -> None:
-    tu = ExtendedTaskUpdater(context, event_queue)
-    await tu.start_work()
-    await tu.add_artifact([ExtendedPart.from_text(context.user.user_id or "anonymous")])
-    await tu.complete()
+async def test_a_bare_string_credential_attaches_a_bearer_header(make_app):
+    """The fallback path in _A2AAuthInterceptor: the target card declares no
+    security scheme at all (cards can't declare one anymore), so a caller who
+    passed credentials= still gets a bearer header attached rather than
+    silently sending nothing."""
+    app, capture = capturing_app(make_app)
+    async with running_app(app) as http:
+        await call_agent(BASE_URL, "hi", http_client=http, credentials=GOOD_TOKEN)
+
+    assert capture["instance"].seen == [f"Bearer {GOOD_TOKEN}"]
 
 
-def secured_app(make_app, *, declare_on_card: bool):
-    """An app behind a gate. `declare_on_card` controls whether the agent card
-    advertises the bearer scheme."""
-    card = build_card()
-    if declare_on_card:
-        card.auth = BearerAuth()
-    return make_app(
-        whoami,
-        card=card,
-        gate_keeper=GateKeeper(FakeVerifier(), FakePermissions()),
-        required_permission="agent:test",
-    )
+async def test_no_credentials_means_no_authorization_header(make_app):
+    app, capture = capturing_app(make_app)
+    async with running_app(app) as http:
+        await call_agent(BASE_URL, "hi", http_client=http)
 
-
-async def test_credentials_reach_the_gate_when_the_card_declares_the_scheme(make_app):
-    async with running_app(secured_app(make_app, declare_on_card=True)) as http:
-        answer = await call_agent(BASE_URL, "hi", http_client=http, credentials=GOOD_TOKEN)
-
-    assert answer == "alice"
-
-
-async def test_credentials_are_sent_even_when_the_card_declares_nothing(make_app):
-    """Native's AuthInterceptor attaches nothing to a card with no declared
-    schemes. That silently produces an unauthenticated call from a caller who
-    explicitly passed a token, so _A2AAuthInterceptor falls back to a bearer
-    header. Without the fallback this test fails with AUTH_REQUIRED."""
-    async with running_app(secured_app(make_app, declare_on_card=False)) as http:
-        answer = await call_agent(BASE_URL, "hi", http_client=http, credentials=GOOD_TOKEN)
-
-    assert answer == "alice"
-
-
-async def test_a_bad_token_still_fails_the_gate(make_app):
-    """Proving the previous two tests aren't passing because the gate is
-    inert."""
-    async with running_app(secured_app(make_app, declare_on_card=True)) as http:
-        result = await call_agent_result(
-            BASE_URL, "hi", http_client=http, credentials="forged"
-        )
-
-    assert result.status is ExtendedTaskState.AUTH_REQUIRED
-
-
-async def test_no_credentials_against_a_gated_agent_is_auth_required(make_app):
-    async with running_app(secured_app(make_app, declare_on_card=True)) as http:
-        result = await call_agent_result(BASE_URL, "hi", http_client=http)
-
-    assert result.status is ExtendedTaskState.AUTH_REQUIRED
+    assert capture["instance"].seen == [None]
 
 
 async def test_a_credential_provider_is_consulted_per_call(make_app):
@@ -96,50 +101,18 @@ async def test_a_credential_provider_is_consulted_per_call(make_app):
             calls.append(scheme_name)
             return GOOD_TOKEN
 
-    async with running_app(secured_app(make_app, declare_on_card=True)) as http:
+    app, capture = capturing_app(make_app)
+    async with running_app(app) as http:
         await call_agent(BASE_URL, "one", http_client=http, credentials=RecordingProvider())
         await call_agent(BASE_URL, "two", http_client=http, credentials=RecordingProvider())
 
     assert len(calls) == 2
+    assert capture["instance"].seen == [f"Bearer {GOOD_TOKEN}"] * 2
 
 
 async def test_static_token_provider_is_equivalent_to_a_bare_string(make_app):
-    async with running_app(secured_app(make_app, declare_on_card=True)) as http:
-        answer = await call_agent(
-            BASE_URL, "hi", http_client=http, credentials=StaticToken(GOOD_TOKEN)
-        )
+    app, capture = capturing_app(make_app)
+    async with running_app(app) as http:
+        await call_agent(BASE_URL, "hi", http_client=http, credentials=StaticToken(GOOD_TOKEN))
 
-    assert answer == "alice"
-
-
-async def test_forwarding_the_callers_token_to_a_downstream_agent(make_app):
-    """The multi-agent shape: a root agent authenticates a user, then calls a
-    domain agent on their behalf by forwarding `context.user.token`. Both
-    servers are real, and the downstream one gates independently."""
-    downstream = secured_app(make_app, declare_on_card=True)
-
-    async with running_app(downstream) as downstream_http:
-
-        async def root_handler(context, event_queue):
-            tu = ExtendedTaskUpdater(context, event_queue)
-            await tu.start_work()
-            # Forward the end user's own credential, not the root agent's.
-            answer = await call_agent(
-                BASE_URL,
-                "who am i",
-                http_client=downstream_http,
-                credentials=context.user.token,
-            )
-            await tu.add_artifact([ExtendedPart.from_text(f"downstream says: {answer}")])
-            await tu.complete()
-
-        root = make_app(
-            root_handler,
-            gate_keeper=GateKeeper(FakeVerifier(), FakePermissions()),
-        )
-        async with running_app(root) as root_http:
-            answer = await call_agent(
-                BASE_URL, "hi", http_client=root_http, credentials=GOOD_TOKEN
-            )
-
-    assert answer == "downstream says: alice"
+    assert capture["instance"].seen == [f"Bearer {GOOD_TOKEN}"]

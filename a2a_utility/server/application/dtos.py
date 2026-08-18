@@ -11,10 +11,6 @@ to `import a2a`.
 
 The constructor still takes the native type: this IS the conversion boundary,
 the same pragmatic trade-off `schema/parts.py` makes with `a2a.types.Part`.
-`.user` reads `domain/models/user_context.py`'s reader function directly
-rather than going through any adapters-layer convenience, so this module
-never depends on `adapters/`, keeping the dependency direction adapters ->
-application -> domain.
 
 There is no declarative task-ending result type here (no HandlerResult) — a
 handler drives `ExtendedTaskUpdater` directly and returns None, the same
@@ -29,7 +25,6 @@ from typing import Any, Optional
 from a2a.server.agent_execution import RequestContext
 
 from ...schema import ExtendedMessage, ExtendedTask, ExtendedTaskState
-from ..domain.models.user_context import UserContext, read_user_context, write_user_context
 
 
 class ExtendedRequestContext:
@@ -97,39 +92,6 @@ class ExtendedRequestContext:
     def metadata(self) -> dict[str, Any]:
         """Request-level metadata sent by the caller."""
         return self._context.metadata
-
-    # ---- identity ------------------------------------------------------ #
-    @property
-    def headers(self) -> dict[str, str]:
-        """The request's HTTP headers, keys lowercased.
-
-        Populated by the context builder. Mainly for the GateKeeper, which
-        reads the credential out of them; a handler wanting caller identity
-        should read `.user` instead of re-parsing headers itself.
-        """
-        raw = self._context.call_context.state.get("headers", {})
-        return {k.lower(): v for k, v in dict(raw).items()}
-
-    @property
-    def user(self) -> UserContext:
-        """Who is calling, and what they may do.
-
-        Populated by the GateKeeper before the handler runs. With no gate
-        configured this is an empty, unauthenticated UserContext — so
-        `context.user.require(...)` in a handler denies everything rather
-        than allowing everything, which is the right way round for a check
-        that silently lost its gate.
-        """
-        return read_user_context(self._context.call_context.state)
-
-    def attach_user(self, user: UserContext) -> None:
-        """Record the authenticated caller for this request.
-
-        Called by `AgentExecutor` once the gate returns Allow; a handler has
-        no reason to call it, and doing so would forge an identity the gate
-        never granted.
-        """
-        write_user_context(self._context.call_context.state, user)
 
     @property
     def is_resuming(self) -> bool:

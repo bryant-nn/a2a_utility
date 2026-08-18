@@ -23,6 +23,15 @@ on.
         result = await agent.send_result("what's the weather?")
         later = await agent.get_task(result.task_id)
 
+If the agent pauses with AUTH_REQUIRED/INPUT_REQUIRED, `result.status` says
+so and `result.task_id` is what continues it — pass it back as `task_id=` on
+the next `send*` call so the server resumes the same task instead of
+starting a new one:
+
+    result = await agent.send_result("book a flight")
+    if result.status is ExtendedTaskState.INPUT_REQUIRED:
+        result = await agent.send_result("thursday", task_id=result.task_id)
+
 The one-shot functions still exist and are built on this, so there are not
 two implementations of the response-parsing logic.
 """
@@ -60,14 +69,25 @@ from .errors import A2ACallError, CALL_FAILED_STATES
 __all__ = ["ExtendedAgentClient"]
 
 
-def build_message(text: str) -> SendMessageRequest:
-    return SendMessageRequest(
-        message=Message(
-            message_id=str(uuid.uuid4()),
-            role=Role.ROLE_USER,
-            parts=[new_text_part(text)],
-        )
+def build_message(text: str, *, task_id: Optional[str] = None) -> SendMessageRequest:
+    """A fresh message, or a reply continuing an existing task.
+
+    `task_id=None` (the default) starts a brand new task — the server has no
+    record of it, so `RequestContext.current_task` comes back empty. Passing
+    the `task_id` of a task the server previously paused with
+    `requires_input()`/`requires_auth()` is what makes it resumable at all:
+    the server looks that id up in its task store and hands the prior state
+    back as `context.current_task`, which is the only way `context.is_resuming`
+    is ever `True` on the other end.
+    """
+    message = Message(
+        message_id=str(uuid.uuid4()),
+        role=Role.ROLE_USER,
+        parts=[new_text_part(text)],
     )
+    if task_id:
+        message.task_id = task_id
+    return SendMessageRequest(message=message)
 
 
 class ExtendedAgentClient:
@@ -148,25 +168,34 @@ class ExtendedAgentClient:
 
     # ---- sending ------------------------------------------------------- #
     async def send_result(
-        self, text: str, *, emit: Optional[PartEmitter] = None
+        self, text: str, *, emit: Optional[PartEmitter] = None, task_id: Optional[str] = None
     ) -> A2ATaskResult:
         """Send `text` and collect the whole exchange into an A2ATaskResult.
+
+        Args:
+          task_id: continue a task the agent previously paused with
+            AUTH_REQUIRED/INPUT_REQUIRED — the id came back on the earlier
+            call's `A2ATaskResult.task_id`. Omit it to start a new task.
 
         Raises:
           A2ACallError: the task ended FAILED or REJECTED.
         """
         client = await self._ensure_client()
-        return await self._collect(client.send_message(build_message(text)), emit=emit)
+        return await self._collect(
+            client.send_message(build_message(text, task_id=task_id)), emit=emit
+        )
 
-    async def send(self, text: str, *, emit: Optional[PartEmitter] = None) -> str:
+    async def send(
+        self, text: str, *, emit: Optional[PartEmitter] = None, task_id: Optional[str] = None
+    ) -> str:
         """Send `text` and return just the answer."""
-        return (await self.send_result(text, emit=emit)).text()
+        return (await self.send_result(text, emit=emit, task_id=task_id)).text()
 
     async def send_parts(
-        self, text: str, *, emit: Optional[PartEmitter] = None
+        self, text: str, *, emit: Optional[PartEmitter] = None, task_id: Optional[str] = None
     ) -> list[ExtendedPart]:
         """Send `text` and return the typed parts of the answer."""
-        return (await self.send_result(text, emit=emit)).parts()
+        return (await self.send_result(text, emit=emit, task_id=task_id)).parts()
 
     # ---- task management ----------------------------------------------- #
     async def get_task(self, task_id: str, *, history_length: Optional[int] = None) -> ExtendedTask:

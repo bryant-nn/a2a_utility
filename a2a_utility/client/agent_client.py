@@ -41,6 +41,7 @@ async def call_agent_result(
     timeout: Optional[float] = None,
     http_client: Optional[httpx.AsyncClient] = None,
     credentials: Optional[Credentials] = None,
+    task_id: Optional[str] = None,
 ) -> A2ATaskResult:
     """Send `text` to the A2A agent at base_url; return a typed A2ATaskResult.
 
@@ -51,8 +52,11 @@ async def call_agent_result(
       http_client: an httpx client to reuse instead of opening one per call.
         The caller keeps ownership; it is never closed here.
       credentials: a bearer token, or a `CredentialProvider` for anything that
-        must be resolved per call. To call a downstream agent on the current
-        caller's behalf, pass `context.user.token`.
+        must be resolved per call — e.g. forwarding a token you received from
+        your own caller on to this downstream agent.
+      task_id: continue a task this agent previously paused with
+        AUTH_REQUIRED/INPUT_REQUIRED — the id came back on the earlier call's
+        `A2ATaskResult.task_id`. Omit it to start a new task.
 
     Raises:
       A2ACallError: the task ended FAILED or REJECTED. A *paused* task
@@ -63,7 +67,7 @@ async def call_agent_result(
         base_url, credentials=credentials, timeout=timeout, http_client=http_client
     )
     try:
-        return await agent.send_result(text, emit=emit)
+        return await agent.send_result(text, emit=emit, task_id=task_id)
     finally:
         await agent.close()
 
@@ -76,6 +80,7 @@ async def call_agent_parts(
     timeout: Optional[float] = None,
     http_client: Optional[httpx.AsyncClient] = None,
     credentials: Optional[Credentials] = None,
+    task_id: Optional[str] = None,
 ) -> list[ExtendedPart]:
     """Same call as call_agent_result, returning just the typed parts."""
     result = await call_agent_result(
@@ -85,6 +90,7 @@ async def call_agent_parts(
         timeout=timeout,
         http_client=http_client,
         credentials=credentials,
+        task_id=task_id,
     )
     return result.parts()
 
@@ -97,6 +103,7 @@ async def call_agent(
     timeout: Optional[float] = None,
     http_client: Optional[httpx.AsyncClient] = None,
     credentials: Optional[Credentials] = None,
+    task_id: Optional[str] = None,
 ) -> str:
     """Same call as call_agent_result, returning only the answer text."""
     result = await call_agent_result(
@@ -106,5 +113,6 @@ async def call_agent(
         timeout=timeout,
         http_client=http_client,
         credentials=credentials,
+        task_id=task_id,
     )
     return result.text()

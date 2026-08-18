@@ -74,14 +74,6 @@ Neither `ExtendedEventQueue` nor `ExtendedTaskUpdater` exposes the
 underlying native object via a `.native`-style escape hatch — a domain
 agent's code never imports anything from `a2a.*`.
 
-Permission/identity rides on the native RequestContext.call_context via a
-`ServerCallContextBuilder`, reachable opt-in via
-ExtendedRequestContext.principal. a2a_utility's own
-`A2AUtilityCallContextBuilder` is a stub (reads plain headers, doesn't
-validate); pass a subclass via `context_builder=` on `create_app()`/
-`serve_as_a2a()` to plug in real JWT/session validation without forking this
-package.
-
 Public surface:
   - Composition:   ExtendedAgentCard, ExtendedAgentSkill, ExtendedAgentProvider,
                    create_app, serve, serve_as_a2a (mode=AGENT|DISCOVERY)
@@ -91,8 +83,9 @@ Public surface:
                    ExtendedTask, ExtendedTaskState, A2ATaskResult,
                    VercelThinkingResponse, SourceReferenceResponse, CustomizedData,
                    PartEmitter, as_thinking_emitter (re-exported from a2a_utility.schema)
-  - Auth:          BearerAuth, ApiKeyAuth, Principal, get_principal,
-                   A2AUtilityCallContextBuilder
+  - Context builder: A2AUtilityCallContextBuilder — the sanctioned extension
+                   point for attaching anything to a request's call_context;
+                   see that module's docstring.
   - Standalone:    run_agent_server, run_discovery_server, ServerMode, A2ASettings
   - Native re-exports: IDGenerator, ServerCallContextBuilder — the two types a
                    caller needs to *name* in order to pass `message_id_generator=`
@@ -105,39 +98,15 @@ from a2a.server.id_generator import IDGenerator
 from a2a.server.routes.common import ServerCallContextBuilder
 
 from .adapters.inbound.agent_executor import AgentExecutor
-from .adapters.inbound.call_context_builder import A2AUtilityCallContextBuilder, get_user_context
-from .adapters.inbound.gate_middleware import GateMiddleware
-from .adapters.outbound.cached_permission_service import CachedPermissionService
-from .adapters.outbound.http_permission_service import (
-    HttpPermissionService,
-    PermissionServiceUnavailable,
-)
+from .adapters.inbound.call_context_builder import A2AUtilityCallContextBuilder
 from .adapters.outbound.event_queue_adapter import ExtendedEventQueue
 from .adapters.outbound.task_updater_adapter import ExtendedTaskUpdater, MessageLike
 from .app import create_app, serve, serve_as_a2a
-from .card import (
-    ApiKeyAuth,
-    AuthScheme,
-    BearerAuth,
-    ExtendedAgentCard,
-    ExtendedAgentProvider,
-    ExtendedAgentSkill,
-)
+from .card import ExtendedAgentCard, ExtendedAgentProvider, ExtendedAgentSkill
 from .application.dtos import ExtendedRequestContext
 from .application.ports.inbound.agent_handler_port import AgentHandlerPort
-from .application.ports.inbound.gate_keeper_port import GateKeeperPort
 from .application.ports.inbound.on_cancel_port import OnCancelPort
-from .application.ports.outbound.permission_service_port import PermissionServicePort
-from .application.ports.outbound.token_verifier_port import InvalidToken, TokenVerifierPort
-from .application.services.gate_keeper import (
-    AllowAllGateKeeper,
-    ClaimNames,
-    GateKeeper,
-)
 from .config import A2ASettings, ServerMode
-from .fastapi import add_to_fastapi
-from .domain.models.auth_decision import Allow, AuthDecision, AuthRequired, Reject
-from .domain.models.user_context import PermissionDenied, UserContext
 from ..schema import (
     A2ATaskResult,
     CustomizedData,
@@ -162,7 +131,6 @@ __all__ = [
     "create_app",
     "serve",
     "serve_as_a2a",
-    "add_to_fastapi",
     # handler contract
     "AgentHandlerPort",
     "OnCancelPort",
@@ -184,31 +152,7 @@ __all__ = [
     "CustomizedData",
     "PartEmitter",
     "as_thinking_emitter",
-    # auth — card declaration
-    "BearerAuth",
-    "ApiKeyAuth",
-    "AuthScheme",
-    # auth — the gate
-    "GateKeeper",
-    "GateKeeperPort",
-    "AllowAllGateKeeper",
-    "ClaimNames",
-    "GateMiddleware",
-    "Allow",
-    "AuthRequired",
-    "Reject",
-    "AuthDecision",
-    # auth — identity a handler reads
-    "UserContext",
-    "PermissionDenied",
-    "get_user_context",
-    # auth — pluggable backends
-    "TokenVerifierPort",
-    "InvalidToken",
-    "PermissionServicePort",
-    "CachedPermissionService",
-    "HttpPermissionService",
-    "PermissionServiceUnavailable",
+    # context builder extension point
     "A2AUtilityCallContextBuilder",
     # standalone nodes
     "run_agent_server",

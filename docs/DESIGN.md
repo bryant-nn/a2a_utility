@@ -62,82 +62,7 @@ grep -rn "^from a2a\.\|^import a2a\b" ../weather_agent ../calculate_agent ...   
 
 ---
 
-## 三、Gate Keeper 為什麼在 executor 裡，不是 Starlette middleware
-
-需求是「失敗 → task state: rejected / auth-required」。
-
-**middleware 做不到這件事**。middleware 只能回 HTTP 狀態碼，產不出 task 事件。只有
-`AgentExecutor.execute()` 裡面的程式碼能把「拒絕」變成一個 A2A client 看得懂的 task state。
-
-所以：
-
-```
-GateMiddleware（可選、只看有沒有 token）  ← 便宜的前置粗篩，回 401
-      ↓
-AgentExecutor.execute()
-      ↓ GateKeeper.authorize()  ← 真正的閘門，回 AuthDecision
-      ├ Reject       → task_updater.reject()        → REJECTED
-      ├ AuthRequired → task_updater.requires_auth() → AUTH_REQUIRED
-      └ Allow        → ctx.attach_user() → handler
-```
-
-`GateMiddleware` 是**可選的效能優化**，不是安全邊界。它只檢查 token 的存在與格式，永遠不驗證 ——
-簽章驗證只有 `TokenVerifierPort` 一個實作，不能有第二份會漂移的。
-
-### 三個決策而不是兩個
-
-`AuthRequired` 和 `Reject` 分開是刻意的：
-
-- **AuthRequired**（沒 token / token 過期或無效）→ 「我不知道你是誰，去拿憑證再來」。**可重試。**
-- **Reject**（有 token 但權限不足）→ 「我知道你是誰，不行」。**重試無意義。**
-
-合併成一種會讓 token 過期的呼叫端放棄、讓沒權限的呼叫端一直重試。client 端也對應：REJECTED/FAILED 丟
-`A2ACallError`（拿不到答案），AUTH_REQUIRED/INPUT_REQUIRED 正常回傳（任務暫停中，理由在
-`status_message`）。
-
-### 為什麼 tool 層級不在 gate 裡
-
-進 handler 之前不可能知道這次請求會用到哪些 tool。所以 tool 層級走「用到的地方檢查」：
-`context.user.require("tool:x")` 丟 `PermissionDenied`，`AgentExecutor` 把它跟一般例外分開接
-（`reject()` 而非 `failed()`），最後落在同一個 REJECTED 狀態。
-
-### 權限服務掛掉時不做任何猜測
-
-`GateKeeper` **沒有**在權限查詢外面包 try/except。兩種默默的處理都不對：
-
-- fail open → gate 形同虛設
-- fail closed → 一次故障看起來像一大批權限 bug
-
-例外往上拋到 `AgentExecutor`，變成帶原因的 FAILED task，讓故障看起來像故障。
-
-### 預設放行，但很吵
-
-沒給 `gate_keeper=` 時裝 `AllowAllGateKeeper` 並印 WARNING。本機開發不該需要一套 token issuer。但
-寬鬆的預設只有在「忘記設」很大聲時才安全，所以：
-
-- 啟動時 WARNING
-- `A2A_REQUIRE_AUTH=true` 讓「沒給 gate」變成**啟動失敗**
-- `AllowAllGateKeeper` 回的是**未驗證**的 `UserContext`，不是萬能的 —— 所以
-  `context.user.require(...)` 在沒有 gate 的環境下仍然會拒絕，而不是放行
-
-最後一點很重要：如果 AllowAll 回一個「什麼權限都有」的 user，那 handler 裡的 tool 檢查會在 gate 被關掉時
-默默失效。方向要反過來。
-
-### card 上的宣告是必要的，不是裝飾
-
-原生 `AuthInterceptor.before()` 的邏輯是：讀 agent card 的 `security_requirements`，逐一比對
-`security_schemes`，找到才掛 header。**card 沒宣告 → 空迴圈 → 什麼都不送。**
-
-所以 `ExtendedAgentCard.auth=BearerAuth()` 一定要設，否則守規矩的 client 一個 header 都不會送，而 server
-全部回 401，兩邊都覺得自己沒錯。
-
-我們的 `_A2AAuthInterceptor` 對這件事多加了一層保險：呼叫端明確給了 `credentials=`，但目標 card 什麼都
-沒宣告時，退回送一個 `Authorization: Bearer`。card 有宣告但原生決定不掛時，**不覆寫** —— 那是原生判斷
-沒有匹配的 scheme，二次猜測會送出對方沒要求的憑證。
-
----
-
-## 四、`ExtendedEventQueue` 的兩個方法
+## 三、`ExtendedEventQueue` 的兩個方法
 
 原生 `EventQueue` 在 1.1.0 變成 ABC，docstring 寫得很直白：
 
@@ -177,7 +102,7 @@ message-mode（`ExtendedTaskUpdater` 結構上做不到），但要送出去就�
 
 ---
 
-## 五、例外安全網：理由已經跟舊版不同
+## 四、例外安全網：理由已經跟舊版不同
 
 **舊版 docstring 是錯的**（對 1.1.2 而言）。它說：
 
@@ -199,7 +124,7 @@ message-mode（`ExtendedTaskUpdater` 結構上做不到），但要送出去就�
 
 ---
 
-## 六、`aclose()` 必須接進 lifespan
+## 五、`aclose()` 必須接進 lifespan
 
 `DefaultRequestHandlerV2.aclose()` 的 docstring：
 
@@ -207,11 +132,10 @@ message-mode（`ExtendedTaskUpdater` 結構上做不到），但要送出去就�
 > Intended to be wired into an ASGI `lifespan` / `on_shutdown` hook.
 
 `create_app` 的 `_make_lifespan` 兩種模式都接了（DISCOVERY 模式以前根本沒有 lifespan）。
-`add_to_fastapi` 因為 FastAPI 有自己的 lifespan，改用 `app.add_event_handler("shutdown", ...)`。
 
 ---
 
-## 七、Client 端：ownership 與那個會咬人的 close
+## 六、Client 端：ownership 與那個會咬人的 close
 
 `Client.close()` → `transport.close()` → **`httpx_client.aclose()`**（見 `JsonRpcTransport.close`）。
 
@@ -231,7 +155,7 @@ Message，message-mode 是**端到端壞掉**的。兩邊都修了，`tests/e2e/
 
 ---
 
-## 八、測試分層
+## 七、測試分層
 
 | 層 | 測什麼 | 為什麼需要 |
 |---|---|---|
@@ -240,21 +164,18 @@ Message，message-mode 是**端到端壞掉**的。兩邊都修了，`tests/e2e/
 | `tests/server/`、`tests/schema/` | 各 adapter 單獨 | 快，但看不到框架的 consumer 端 |
 
 `tests/conftest.py` 的 `FakeEventQueue` 只模擬 producer 端。**下列問題單元測試一個都抓不到**，都需要
-e2e：Task 必須先於 status 事件、`aclose()` 沒接、message-mode 壞掉、gate 拒絕產出什麼 task state、
-憑證有沒有真的送到 header 上。
+e2e：Task 必須先於 status 事件、`aclose()` 沒接、message-mode 壞掉、憑證有沒有真的送到 header 上。
 
 ---
 
-## 九、分層規則
+## 八、分層規則
 
 ```
 adapters/  →  application/  →  domain/
 ```
 
-- `domain/` 不 import 任何框架。`user_context.py` 只操作純 `dict`（剛好就是原生
-  `ServerCallContext.state` 的型別，但這個模組從不指名那個型別）。
-- `application/dtos.py` 讀 `domain/models/user_context.py` 的 reader function，**不走 adapters 層的
-  便利函式** —— 否則依賴方向就反了。
+- `domain/` 不 import 任何框架 —— `domain/models/agent_card.py` 的 `AgentDescriptor` 是純 dataclass，
+  不碰 a2a-sdk 或 Starlette。
 - `app.py`／`main.py` 是 composition root，唯一允許把所有層兜起來的地方。
 
 `AgentHandlerPort` 的第二個參數型別是 `ExtendedEventQueue`（adapters 層）—— 這是唯一一個刻意的例外，
@@ -262,7 +183,7 @@ adapters/  →  application/  →  domain/
 
 ---
 
-## 十、命名
+## 九、命名
 
 一律 `Extended*` 前綴。曾經考慮全部拿掉前綴、讓套件名承擔區隔（`from a2a_utility import Part`），對
 agent 作者最直覺，但會讓 library 內部在轉換邊界同時看到兩套同名型別。目前的選擇是保留前綴，好處是

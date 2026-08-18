@@ -11,8 +11,8 @@ Public surface:
   - A2ACallError: raised when the remote task ended FAILED or REJECTED; carries
     `.status` so a caller can tell "not permitted" from "broke".
   - Credentials / CredentialProvider / StaticToken: what to authenticate with.
-    Pass `credentials=context.user.token` to call a downstream agent on the
-    current caller's behalf.
+    Pass `credentials=<token>` to forward an identity to a downstream agent
+    on the caller's behalf.
   - PartEmitter: the live-streaming callback contract (the same type a
     server-side AgentHandlerPort receives).
   - DiscoveryClient: cached directory lookups against an a2a_utility DISCOVERY node.

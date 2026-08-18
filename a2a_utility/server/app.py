@@ -3,9 +3,8 @@
 A domain agent hands create_app a plain AgentHandlerPort callable (a function,
 or an object with __call__ — see application/ports/inbound/agent_handler_port.py)
 together with an AgentCard, mode=ServerMode.AGENT (the default). create_app
-builds adapters/inbound/agent_executor.py's AgentExecutor around that handler,
-wires the native a2a request handler + routes, and injects a2a_utility's
-ServerCallContextBuilder (for Principal/permission). A domain agent never
+builds adapters/inbound/agent_executor.py's AgentExecutor around that handler
+and wires the native a2a request handler + routes. A domain agent never
 imports AgentExecutor itself — only this module and application.dtos/
 application.ports.inbound.agent_handler_port. serve_as_a2a is the one-call
 convenience that also builds the card and runs uvicorn with registry
@@ -54,9 +53,7 @@ from .adapters.inbound.call_context_builder import A2AUtilityCallContextBuilder
 from .adapters.inbound.discovery_agent_executor import DiscoveryAgentExecutor
 from .adapters.outbound.in_memory_registry_adapter import InMemoryRegistryAdapter
 from .application.ports.inbound.agent_handler_port import AgentHandlerPort
-from .application.ports.inbound.gate_keeper_port import GateKeeperPort
 from .application.ports.inbound.on_cancel_port import OnCancelPort
-from .application.services.gate_keeper import AllowAllGateKeeper
 from .application.ports.outbound.registry_port import AgentRegistryPort
 from .application.use_cases.register_agent_card_use_case import RegisterAgentCardUseCase
 from .application.use_cases.search_agent_use_case import SearchAgentUseCase
@@ -130,39 +127,6 @@ def _make_lifespan(
             await request_handler.aclose()
 
     return lifespan
-
-
-# --------------------------------------------------------------------------- #
-# Auth wiring                                                                  #
-# --------------------------------------------------------------------------- #
-def _resolve_gate_keeper(
-    gate_keeper: Optional[GateKeeperPort], require_auth: bool, agent_name: str
-) -> GateKeeperPort:
-    """The gate to install, refusing to start if auth is required but absent.
-
-    The default is permissive on purpose — a developer running an agent
-    locally shouldn't need a token issuer — but a permissive default is only
-    safe if forgetting it is loud. Hence the warning here and the hard failure
-    under `require_auth`, which deployments set via `A2A_REQUIRE_AUTH=true`.
-    """
-    if gate_keeper is not None:
-        return gate_keeper
-
-    if require_auth:
-        raise ValueError(
-            f"{agent_name}: require_auth is set but no gate_keeper was given. "
-            "Pass gate_keeper=GateKeeper(...), or build one from settings with "
-            "A2ASettings().build_gate_keeper() (needs A2A_JWKS_URL)."
-        )
-
-    logger.warning(
-        "%s: no gate_keeper configured — every request is allowed and "
-        "context.user will be unauthenticated. Fine for local development; "
-        "set A2A_REQUIRE_AUTH=true in deployed environments so this can't "
-        "ship by accident.",
-        agent_name,
-    )
-    return AllowAllGateKeeper()
 
 
 # --------------------------------------------------------------------------- #
@@ -242,9 +206,6 @@ def create_app(
     registry: Optional[AgentRegistryPort] = None,
     context_builder: Optional[ServerCallContextBuilder] = None,
     message_id_generator: Optional[IDGenerator] = None,
-    gate_keeper: Optional[GateKeeperPort] = None,
-    required_permission: Optional[str] = None,
-    require_auth: bool = False,
     task_store: Optional[TaskStore] = None,
     push_config_store: Optional[PushNotificationConfigStore] = None,
     push_sender: Optional[PushNotificationSender] = None,
@@ -261,18 +222,6 @@ def create_app(
     AgentHandlerPort callable, not an AgentExecutor) behind the native a2a
     request handler.
 
-    Auth:
-      `gate_keeper` runs before every handler invocation and can end the task
-      REJECTED/AUTH_REQUIRED without it ever reaching the handler; see
-      `application/services/gate_keeper.py`. `required_permission` is the
-      agent-level permission it checks. Omitting `gate_keeper` installs
-      `AllowAllGateKeeper` and logs a warning — convenient locally, wrong
-      everywhere else, which is what `require_auth=True` guards: it turns the
-      omission into a startup error rather than a silently open server.
-      Remember to declare the scheme on the card too (`ExtendedAgentCard
-      (auth=BearerAuth())`), or well-behaved clients won't know to send
-      anything.
-
     Other injectables:
       `on_cancel` reacts to an externally requested cancellation; most agents
       don't need it (the default marks the task CANCELED).
@@ -282,14 +231,14 @@ def create_app(
       `push_config_store`/`push_sender` enable push notifications; both are
       needed for them to work.
       `middleware` and `extra_routes` are merged into the Starlette app, for
-      health checks, metrics, or `GateMiddleware`.
+      health checks, metrics, or any other cross-cutting concern.
       `include_rest_routes` also mounts A2A's REST binding beside JSON-RPC.
       Off by default: JSON-RPC is what `a2a_utility.client` and most A2A
       clients speak, and every mounted route is more surface to secure.
-      `message_id_generator` is used only by `AgentExecutor`'s own paths (the
-      throwaway `ExtendedTaskUpdater` it builds for gate refusals and the
-      exception safety net) — a handler builds its own updater and can pass
-      whatever generators it likes there, per-instance.
+      `message_id_generator` is used only by `AgentExecutor`'s own exception-
+      safety-net path (the throwaway `ExtendedTaskUpdater` it builds to send
+      a FAILED status if `handler` raises) — a handler builds its own updater
+      and can pass whatever generators it likes there, per-instance.
 
     mode=DISCOVERY: `handler`/`on_cancel`/`message_id_generator` are not used
     (a registry node has no LLM/domain logic of its own) — see
@@ -299,21 +248,9 @@ def create_app(
     consistency with AGENT mode.
 
     Raises:
-      ValueError: mode=AGENT with no `handler`, or `require_auth=True` with
-        no `gate_keeper`; mode=DISCOVERY with `gate_keeper`/`require_auth`/
-        `required_permission` set — DISCOVERY mode doesn't run them through
-        the gate yet, and silently dropping them would look like the auth
-        was applied when it wasn't.
+      ValueError: mode=AGENT with no `handler`.
     """
     if mode == ServerMode.DISCOVERY:
-        if gate_keeper is not None or require_auth or required_permission is not None:
-            raise ValueError(
-                "create_app(mode=DISCOVERY) does not support gate_keeper/"
-                "require_auth/required_permission yet — a DISCOVERY node's "
-                "AgentExecutor doesn't run the gate. Passing them here would "
-                "silently leave the registry unauthenticated; if you need "
-                "this, put GateMiddleware in front instead."
-            )
         return _create_discovery_app(
             agent_card=agent_card, rpc_url=rpc_url, registry=registry, context_builder=context_builder
         )
@@ -321,15 +258,11 @@ def create_app(
     if handler is None:
         raise ValueError("create_app(mode=AGENT) requires a `handler`")
 
-    gate_keeper = _resolve_gate_keeper(gate_keeper, require_auth, agent_card.name)
-
     proto_card = agent_card.to_agent_card()
     request_handler = DefaultRequestHandler(
         agent_executor=AgentExecutor(
             handler=handler,
             on_cancel=on_cancel,
-            gate_keeper=gate_keeper,
-            required_permission=required_permission,
             message_id_generator=message_id_generator,
         ),
         task_store=task_store or InMemoryTaskStore(),
@@ -368,9 +301,6 @@ def serve_as_a2a(
     registry: Optional[AgentRegistryPort] = None,
     context_builder: Optional[ServerCallContextBuilder] = None,
     message_id_generator: Optional[IDGenerator] = None,
-    gate_keeper: Optional[GateKeeperPort] = None,
-    required_permission: Optional[str] = None,
-    require_auth: bool = False,
     task_store: Optional[TaskStore] = None,
     push_config_store: Optional[PushNotificationConfigStore] = None,
     push_sender: Optional[PushNotificationSender] = None,
@@ -388,11 +318,10 @@ def serve_as_a2a(
     mode=AGENT (default): `handler` (required) is a domain-agent-authored
     AgentHandlerPort — a plain async function, or an object with __call__ if the
     agent wants to hold construction state. Every other keyword is optional and
-    forwarded to `create_app` unchanged — `gate_keeper`/`required_permission`/
-    `require_auth` for auth, `task_store`/`push_*` for durability, `middleware`/
-    `extra_routes` for anything else mounted alongside; see create_app's
-    docstring for each. If registry_url is given, self-registers {name,
-    description, agent_card_url} and heartbeats.
+    forwarded to `create_app` unchanged — `task_store`/`push_*` for durability,
+    `middleware`/`extra_routes` for anything else mounted alongside; see
+    create_app's docstring for each. If registry_url is given, self-registers
+    {name, description, agent_card_url} and heartbeats.
 
     mode=DISCOVERY: `handler`/`on_cancel`/registry_url/`message_id_generator`
     are ignored (a registry node doesn't self-register or run any handler);
@@ -421,9 +350,6 @@ def serve_as_a2a(
         registration_payload=registration_payload,
         context_builder=context_builder,
         message_id_generator=message_id_generator,
-        gate_keeper=gate_keeper,
-        required_permission=required_permission,
-        require_auth=require_auth,
         task_store=task_store,
         push_config_store=push_config_store,
         push_sender=push_sender,
