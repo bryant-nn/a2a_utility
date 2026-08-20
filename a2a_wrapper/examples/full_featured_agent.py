@@ -30,6 +30,8 @@ import asyncio
 from a2a_wrapper import (
     ArtifactResult,
     AuthRequired,
+    CustomizedData,
+    DataType,
     DomainAgentExecutorPort,
     DomainContext,
     ExtendedAgentCard,
@@ -78,7 +80,11 @@ class FullFeaturedAgent(DomainAgentExecutorPort):
             raise ValueError(f"could not handle: {text!r}")
 
         if "stream" in text:
-            # A visible multi-step "thinking" sequence before the answer —
+            # A visible multi-step "thinking" sequence before the answer, as
+            # structured data (DataType.VERCEL_THINKING) rather than plain
+            # text — lets a frontend render reasoning steps distinctly from
+            # regular status text (e.g. Vercel AI SDK's "reasoning" message
+            # part: collapsed/muted, shown separately from the final answer).
             # await asyncio.sleep(), not time.sleep(): the latter blocks the
             # whole event loop (nothing gets flushed to the client, and no
             # other request can be served either) until it returns, so every
@@ -89,7 +95,16 @@ class FullFeaturedAgent(DomainAgentExecutorPort):
                 "composing a long answer in pieces...",
             ]
             for step in thinking_steps:
-                yield StatusMessage(parts=[ExtendedPart(text=step)])
+                yield StatusMessage(
+                    parts=[
+                        ExtendedPart(
+                            data=CustomizedData(
+                                data_type=DataType.VERCEL_THINKING,
+                                data_content={"text": step},
+                            )
+                        )
+                    ]
+                )
                 await asyncio.sleep(1)
 
             words = ["This ", "answer ", "arrives ", "in ", "chunks."]
@@ -102,8 +117,24 @@ class FullFeaturedAgent(DomainAgentExecutorPort):
                 )
                 await asyncio.sleep(0.4)
 
+            # The final chunk also carries a source_reference data part —
+            # a second, independent Part alongside the closing text, not
+            # merged into it (ExtendedPart allows exactly one content field).
             yield ArtifactResult(
-                parts=[ExtendedPart(text="done!")],
+                parts=[
+                    ExtendedPart(text="done!"),
+                    ExtendedPart(
+                        data=CustomizedData(
+                            data_type=DataType.SOURCE_REFERENCE,
+                            data_content={
+                                "merged_reference": [
+                                    "https://example.com/docs/streaming",
+                                    "https://example.com/docs/artifacts",
+                                ]
+                            },
+                        )
+                    ),
+                ],
                 artifact_id="streamed-answer",
                 append=True,
                 last_chunk=True,

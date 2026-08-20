@@ -121,7 +121,7 @@ what you type (not just the browser UI; the same keywords work through
 | Type | What happens | TaskEvent |
 |---|---|---|
 | anything else | one "thinking..." progress bubble, then the final answer, COMPLETED | `TextChunk` + `ArtifactResult` |
-| `stream please` | 3 progress bubbles ~1s apart ("analyzing the request..." → "breaking it down into steps..." → "composing..."), then the answer streamed in across 6 artifact chunks ~0.4s apart | `StatusMessage` × 3, then `ArtifactResult` × 6 (`append`/`last_chunk`) |
+| `stream please` | 3 "thinking" bubbles ~1s apart ("analyzing the request..." → "breaking it down into steps..." → "composing..."), then the answer streamed in across 6 artifact chunks ~0.4s apart, then a source list | `StatusMessage` × 3 (each a `vercel_thinking` data part), then `ArtifactResult` × 6 (`append`/`last_chunk`; the last chunk also carries a `source_reference` data part) |
 | `input please` | pauses INPUT_REQUIRED, asks "which city?" | `InputRequired` |
 | `auth please` | pauses AUTH_REQUIRED, asks for credentials | `AuthRequired` |
 | `reject me` | ends REJECTED outright | `Rejected` |
@@ -168,12 +168,18 @@ async def execute(self, context: DomainContext):
 
 ## Custom Data Types
 
-Supports registering custom data types (e.g., Vercel thinking, source references):
+`ExtendedPart.data` carries a `CustomizedData` envelope (`{data_type, data_content}`) instead
+of plain text — a structural way to tag a part's meaning so a frontend can render it
+differently from an ordinary status/artifact, without parsing text. Two are predefined:
+
+| `DataType` | Content shape | Use it when |
+|---|---|---|
+| `VERCEL_THINKING` | `{"text": str}` | narrating a reasoning/thinking step (as opposed to a plain progress message) — the name follows the Vercel AI SDK convention of a distinct "reasoning" message part, so a UI can show it collapsed/muted and separate from the final answer instead of mixing it into regular status text |
+| `SOURCE_REFERENCE` | `{"merged_reference": list[str]}` | attaching the citations/sources an answer draws from — typically as an extra part on the final `ArtifactResult` chunk, alongside (not merged into) the closing text part |
 
 ```python
 from a2a_wrapper.types import CustomizedData, DataType, ExtendedPart
 
-# Use predefined types
 yield StatusMessage(
     parts=[
         ExtendedPart(
@@ -187,6 +193,14 @@ yield StatusMessage(
 
 # Or use custom types (schema must be registered first)
 ```
+
+`full_featured_agent.py`'s `stream please` path demonstrates both live — the 3 thinking
+steps are `vercel_thinking` data parts, and the final chunk carries a `source_reference`
+data part alongside its text. `native_client.py` decodes both off the wire (reading
+`google.protobuf.Struct` directly, no `a2a_wrapper` import) into `{"type": "thinking", ...}`
+/ `{"type": "sources", ...}` SSE events, and `index.html` renders them as their own bubble
+styles — see `_data_payload()` in `native_client.py` for the parsing pattern to copy
+against any other data type you register.
 
 ## File Parts
 

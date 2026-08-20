@@ -44,6 +44,9 @@
   .row.user .bubble { background: var(--user-bg); color: var(--user-fg); }
   .row.agent .bubble { background: var(--agent-bg); color: var(--agent-fg); }
   .row.agent .bubble.progress { color: var(--muted); font-style: italic; }
+  .row.agent .bubble.thinking { color: var(--muted); font-style: italic; opacity: 0.75; }
+  .row.agent .bubble.sources { font-size: 12px; color: var(--muted); }
+  .row.agent .bubble.sources a { color: inherit; }
   .row.agent .bubble.status {
     font-size: 12px; color: var(--muted); background: none; padding: 0;
   }
@@ -140,10 +143,14 @@ async function send() {
       updateBadge();
     } else if (ev.type === 'progress') {
       progressBubble = addRow('agent', ev.text, 'progress');
+    } else if (ev.type === 'thinking') {
+      addRow('agent', ev.text, 'thinking');
     } else if (ev.type === 'artifact') {
       if (!artifactBubble) artifactBubble = addRow('agent', '', null);
       artifactBubble.textContent += ev.text;
       log.scrollTop = log.scrollHeight;
+    } else if (ev.type === 'sources') {
+      addRow('agent', 'Sources:\n' + ev.references.join('\n'), 'sources');
     } else if (ev.type === 'message') {
       addRow('agent', ev.text);
     } else if (ev.type === 'done') {

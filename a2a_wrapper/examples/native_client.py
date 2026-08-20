@@ -17,7 +17,8 @@ from typing import Any, AsyncIterator, Optional
 import httpx
 from a2a.client import ClientConfig, create_client
 from a2a.helpers import new_text_part
-from a2a.types import CancelTaskRequest, Message, Role, SendMessageRequest, TaskState
+from a2a.types import CancelTaskRequest, Message, Part, Role, SendMessageRequest, TaskState
+from google.protobuf.json_format import MessageToDict
 
 
 def _build_message(text: str, task_id: Optional[str] = None) -> Message:
@@ -29,6 +30,21 @@ def _build_message(text: str, task_id: Optional[str] = None) -> Message:
     if task_id:
         message.task_id = task_id
     return message
+
+
+def _data_payload(part: Part) -> Optional[dict[str, Any]]:
+    """Decode a `data` Part's `{data_type, data_content}` envelope, if that's what it is.
+
+    Reads the wire format directly (`google.protobuf.Struct` -> dict) rather
+    than importing a2a_wrapper's `CustomizedData`/`DataType` — this file stays
+    a plain a2a.client example, not an a2a_wrapper-specific one.
+    """
+    if part.WhichOneof("content") != "data":
+        return None
+    raw = MessageToDict(part.data)
+    if isinstance(raw, dict) and "data_type" in raw and "data_content" in raw:
+        return raw
+    return None
 
 
 async def stream_agent(
@@ -53,8 +69,11 @@ async def stream_agent(
         `{"type": "task_id", "task_id": str}` once, as soon as the task id is
         known — before any progress/artifact events, so a caller can cancel
         mid-stream instead of only after the exchange finishes;
-        `{"type": "progress", "text": str}` for a WORKING status message,
-        `{"type": "artifact", "text": str}` for each artifact chunk,
+        `{"type": "progress", "text": str}` for a plain-text WORKING status
+        message, `{"type": "thinking", "text": str}` for a `vercel_thinking`
+        data part on one, `{"type": "artifact", "text": str}` for each
+        plain-text artifact chunk, `{"type": "sources", "references":
+        list[str]}` for a `source_reference` data part on one,
         `{"type": "message", "text": str}` for a message-mode reply, and
         finally exactly one `{"type": "done", "status": str, "task_id": str,
         "text": str, "status_message": str | None}` — `status` is the
@@ -101,16 +120,26 @@ async def stream_agent(
                 status = update.status.state
                 if update.status.HasField("message"):
                     parts = update.status.message.parts
-                    text_piece = parts[0].text if parts else None
-                    if status == TaskState.TASK_STATE_WORKING and text_piece:
-                        yield {"type": "progress", "text": text_piece}
-                    status_message = text_piece
+                    part = parts[0] if parts else None
+                    payload = _data_payload(part) if part is not None else None
+                    if payload and payload["data_type"] == "vercel_thinking":
+                        if status == TaskState.TASK_STATE_WORKING:
+                            yield {"type": "thinking", "text": payload["data_content"].get("text", "")}
+                        status_message = None
+                    else:
+                        text_piece = part.text if part is not None else None
+                        if status == TaskState.TASK_STATE_WORKING and text_piece:
+                            yield {"type": "progress", "text": text_piece}
+                        status_message = text_piece
 
             elif event.HasField("artifact_update"):
                 update = event.artifact_update
                 current_task_id = update.task_id or current_task_id
                 for part in update.artifact.parts:
-                    if part.text:
+                    payload = _data_payload(part)
+                    if payload and payload["data_type"] == "source_reference":
+                        yield {"type": "sources", "references": payload["data_content"].get("merged_reference", [])}
+                    elif part.text:
                         artifact_text.append(part.text)
                         yield {"type": "artifact", "text": part.text}
 
