@@ -21,7 +21,7 @@ from a2a.server.agent_execution import RequestContext
 from a2a.server.context import ServerCallContext
 from a2a.types import Message, Role, SendMessageRequest
 
-from a2a_utility.server import ExtendedEventQueue, ExtendedRequestContext
+from a2a_utility.server import ExtendedRequestContext
 
 
 class FakeEventQueue:
@@ -52,14 +52,5 @@ def request_context() -> RequestContext:
 
 @pytest.fixture
 def extended_request_context(request_context: RequestContext) -> ExtendedRequestContext:
-    """The typed context, as a handler receives it — and what
-    ExtendedTaskUpdater takes."""
+    """The typed context, as a DomainAgentExecutorPort.execute() receives it."""
     return ExtendedRequestContext(request_context)
-
-
-@pytest.fixture
-def extended_event_queue(event_queue: FakeEventQueue, request_context: RequestContext) -> ExtendedEventQueue:
-    """ExtendedEventQueue pre-wired with the matching expected_task_id, since
-    that's what AgentExecutor always does — most tests want this, not a bare
-    unvalidated ExtendedEventQueue."""
-    return ExtendedEventQueue(event_queue, expected_task_id=request_context.task_id)

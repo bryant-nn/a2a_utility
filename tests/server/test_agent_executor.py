@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import pytest
 from a2a.types import TaskState
 
 from a2a_utility.schema import ExtendedPart
-from a2a_utility.server import ExtendedEventQueue, ExtendedTaskUpdater
+from a2a_utility.server import DomainAgentExecutorPort, Progress, PublishArtifact
 from a2a_utility.server.adapters.inbound.agent_executor import AgentExecutor
 
 
@@ -16,61 +15,44 @@ def _status_states(event_queue) -> list[TaskState.ValueType]:
     ]
 
 
-async def test_handler_gets_an_extended_event_queue_matching_native_execute_signature(request_context, event_queue):
-    received = {}
+class _NoOp(DomainAgentExecutorPort):
+    async def execute(self, context):
+        return
+        yield  # pragma: no cover — makes this an async generator
 
-    async def handler(context, eq):
-        received["eq_type"] = type(eq)
 
-    executor = AgentExecutor(handler=handler)
+async def test_not_yielding_anything_still_completes_the_task(request_context, event_queue):
+    """No imperative start_work()/complete() to forget anymore — a domain
+    executor that yields nothing at all still ends up COMPLETED, because
+    completion is implicit at generator exhaustion, not something the
+    executor opts into. This is the declarative model's whole point, and a
+    deliberate behavior change from the old imperative AgentHandlerPort
+    (which sent nothing at all if the handler did nothing)."""
+    executor = AgentExecutor(_NoOp())
     await executor.execute(request_context, event_queue)
-    assert received["eq_type"] is ExtendedEventQueue
+    assert _status_states(event_queue) == [TaskState.TASK_STATE_COMPLETED]
 
 
-async def test_no_automatic_start_work_handler_must_send_it_itself(request_context, event_queue):
-    async def handler(context, eq):
-        pass  # deliberately does nothing
+async def test_executor_yielding_progress_and_artifact_completes_normally(request_context, event_queue):
+    class Executor(DomainAgentExecutorPort):
+        async def execute(self, context):
+            yield Progress("go")
+            yield PublishArtifact(parts=[ExtendedPart.from_text("42")])
 
-    executor = AgentExecutor(handler=handler)
-    await executor.execute(request_context, event_queue)
-    # No status/artifact events at all — matches native: nothing is auto-sent.
-    assert event_queue.events == []
-
-
-async def test_handler_completing_normally_sends_exactly_what_it_asked_for(request_context, event_queue):
-    async def handler(context, eq):
-        tu = ExtendedTaskUpdater(context, eq)
-        await tu.start_work()
-        await tu.add_artifact([ExtendedPart.from_text("42")])
-        await tu.complete()
-
-    executor = AgentExecutor(handler=handler)
+    executor = AgentExecutor(Executor())
     await executor.execute(request_context, event_queue)
 
     states = _status_states(event_queue)
     assert states == [TaskState.TASK_STATE_WORKING, TaskState.TASK_STATE_COMPLETED]
 
 
-async def test_handler_returning_without_responding_leaves_task_at_whatever_state_it_was(request_context, event_queue):
-    """No 'forgot to respond' safety net anymore — matches native, which
-    doesn't enforce this either. A handler that never calls anything just
-    leaves the task un-terminated; that's on the handler, not a2a_utility."""
-    async def handler(context, eq):
-        tu = ExtendedTaskUpdater(context, eq)
-        await tu.start_work()
-        # ... and then just returns without completing.
+async def test_unhandled_exception_becomes_failed_via_the_same_updater(request_context, event_queue):
+    class Executor(DomainAgentExecutorPort):
+        async def execute(self, context):
+            raise ValueError("boom")
+            yield  # pragma: no cover
 
-    executor = AgentExecutor(handler=handler)
-    await executor.execute(request_context, event_queue)
-
-    assert _status_states(event_queue) == [TaskState.TASK_STATE_WORKING]
-
-
-async def test_unhandled_exception_becomes_failed_via_throwaway_updater(request_context, event_queue):
-    async def handler(context, eq):
-        raise ValueError("boom")
-
-    executor = AgentExecutor(handler=handler)
+    executor = AgentExecutor(Executor())
     await executor.execute(request_context, event_queue)
 
     states = _status_states(event_queue)
@@ -79,56 +61,73 @@ async def test_unhandled_exception_becomes_failed_via_throwaway_updater(request_
     assert "boom" in failed_event.status.message.parts[0].text
 
 
-async def test_exception_after_handler_already_completed_still_does_not_raise(request_context, event_queue):
-    """Documented residual trade-off (see agent_executor.py's module
-    docstring / the plan's "已知殘留取捨"): the except block's throwaway
-    ExtendedTaskUpdater is a brand-new instance with its own fresh
-    `_terminal_state_reached`, so native's per-instance double-terminal guard
-    does NOT know the handler's own instance already completed — it does
-    NOT raise, and a second (spurious) FAILED status genuinely gets sent.
-    contextlib.suppress(RuntimeError) only helps for the cases where native
-    *does* detect it (rare — would require reusing the same instance);
-    it is not, and isn't meant to be, a guarantee against every double-send.
-    This test locks in that this stays non-fatal, not that it stays clean."""
-    async def handler(context, eq):
-        tu = ExtendedTaskUpdater(context, eq)
-        await tu.start_work()
-        await tu.complete()
-        raise RuntimeError("crashed during cleanup, after already answering")
+async def test_exception_mid_stream_after_content_already_sent(request_context, event_queue):
+    """Unlike the old imperative design (where a handler's own updater and
+    the exception safety net's throwaway updater were two different
+    instances — so a handler that completed and then raised anyway could
+    produce a spurious duplicate terminal status), there is now exactly one
+    `TaskUpdater` per execute() call, shared by the happy path and the except
+    block. A generator can't both reach implicit completion *and* raise
+    afterward — raising always happens mid-iteration, before completion is
+    ever reached — so this scenario (terminal state already reached, then
+    failed() called again) is structurally unreachable now, not just handled
+    gracefully."""
+    class Executor(DomainAgentExecutorPort):
+        async def execute(self, context):
+            yield Progress("go")
+            yield PublishArtifact(parts=[ExtendedPart.from_text("partial")])
+            raise RuntimeError("crashed mid-stream")
 
-    executor = AgentExecutor(handler=handler)
+    executor = AgentExecutor(Executor())
     await executor.execute(request_context, event_queue)  # must not raise
 
     states = _status_states(event_queue)
-    assert states == [TaskState.TASK_STATE_WORKING, TaskState.TASK_STATE_COMPLETED, TaskState.TASK_STATE_FAILED]
+    assert states == [TaskState.TASK_STATE_WORKING, TaskState.TASK_STATE_FAILED]
 
 
-async def test_cancel_without_on_cancel_marks_canceled(request_context, event_queue):
-    executor = AgentExecutor(handler=lambda ctx, eq: None)
+async def test_cancel_without_override_marks_canceled_with_no_message(request_context, event_queue):
+    executor = AgentExecutor(_NoOp())
     await executor.cancel(request_context, event_queue)
+
     assert _status_states(event_queue) == [TaskState.TASK_STATE_CANCELED]
+    canceled_event = next(e for e in event_queue.events if e.__class__.__name__ == "TaskStatusUpdateEvent")
+    assert not canceled_event.status.HasField("message")
 
 
-async def test_cancel_with_on_cancel_lets_it_fully_own_the_outcome(request_context, event_queue):
+async def test_cancel_override_supplies_a_custom_message(request_context, event_queue):
+    """The task is still marked CANCELED regardless of what cancel() returns
+    — the override only supplies the message attached to that status, it
+    doesn't get to choose a different outcome."""
     calls = []
 
-    async def on_cancel(context, eq):
-        calls.append(1)
-        tu = ExtendedTaskUpdater(context, eq)
-        await tu.cancel()
+    class Executor(DomainAgentExecutorPort):
+        async def execute(self, context):
+            return
+            yield  # pragma: no cover
 
-    executor = AgentExecutor(handler=lambda ctx, eq: None, on_cancel=on_cancel)
+        async def cancel(self, context):
+            calls.append(1)
+            return "cleaned up gracefully"
+
+    executor = AgentExecutor(Executor())
     await executor.cancel(request_context, event_queue)
 
     assert calls == [1]
     assert _status_states(event_queue) == [TaskState.TASK_STATE_CANCELED]
+    canceled_event = next(e for e in event_queue.events if e.__class__.__name__ == "TaskStatusUpdateEvent")
+    assert canceled_event.status.message.parts[0].text == "cleaned up gracefully"
 
 
-async def test_on_cancel_exception_falls_back_to_default_cancel(request_context, event_queue):
-    async def broken_on_cancel(context, eq):
-        raise RuntimeError("on_cancel itself is buggy")
+async def test_cancel_override_raising_falls_back_to_the_default(request_context, event_queue):
+    class Executor(DomainAgentExecutorPort):
+        async def execute(self, context):
+            return
+            yield  # pragma: no cover
 
-    executor = AgentExecutor(handler=lambda ctx, eq: None, on_cancel=broken_on_cancel)
+        async def cancel(self, context):
+            raise RuntimeError("cancel() itself is buggy")
+
+    executor = AgentExecutor(Executor())
     await executor.cancel(request_context, event_queue)  # must not raise
 
     assert _status_states(event_queue) == [TaskState.TASK_STATE_CANCELED]
@@ -139,10 +138,12 @@ async def test_message_id_generator_is_used_by_the_exception_safety_net(request_
         def generate(self, context):
             return "fixed-message-id"
 
-    async def handler(context, eq):
-        raise ValueError("boom")
+    class Executor(DomainAgentExecutorPort):
+        async def execute(self, context):
+            raise ValueError("boom")
+            yield  # pragma: no cover
 
-    executor = AgentExecutor(handler=handler, message_id_generator=FixedMessageGenerator())
+    executor = AgentExecutor(Executor(), message_id_generator=FixedMessageGenerator())
     await executor.execute(request_context, event_queue)
 
     failed_event = next(e for e in event_queue.events if e.__class__.__name__ == "TaskStatusUpdateEvent")

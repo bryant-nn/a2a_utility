@@ -10,34 +10,40 @@ import pytest
 
 from a2a_utility.client import A2ACallError, call_agent, call_agent_result
 from a2a_utility.schema import ExtendedPart, ExtendedTaskState
+from a2a_utility.server import (
+    AuthRequired,
+    DomainAgentExecutorPort,
+    InputRequired,
+    MessageReply,
+    Progress,
+    PublishArtifact,
+    Rejected,
+)
 
 from harness import BASE_URL, running_app
 
 
 async def test_normal_task_lifecycle_round_trips_every_part_type(make_app):
-    """The happy path, through the real JSON-RPC + SSE stack: a handler
-    streams thinking, publishes a mixed artifact, and completes."""
+    """The happy path, through the real JSON-RPC + SSE stack: an executor
+    yields a Progress event, publishes a mixed artifact, and returns
+    (marking the task COMPLETED)."""
 
-    async def handler(context, event_queue):
-        from a2a_utility.server import ExtendedTaskUpdater
-
-        tu = ExtendedTaskUpdater(context, event_queue)
-        await tu.start_work()
-        await tu.as_part_emitter()(ExtendedPart.thinking("looking it up"))
-        await tu.add_artifact(
-            [
-                ExtendedPart.source_reference([{"source": "test"}]),
-                ExtendedPart.from_text(f"echo: {context.get_user_input()}"),
-            ]
-        )
-        await tu.complete()
+    class Executor(DomainAgentExecutorPort):
+        async def execute(self, context):
+            yield Progress(ExtendedPart.thinking("looking it up"))
+            yield PublishArtifact(
+                parts=[
+                    ExtendedPart.source_reference([{"source": "test"}]),
+                    ExtendedPart.from_text(f"echo: {context.get_user_input()}"),
+                ]
+            )
 
     streamed: list[ExtendedPart] = []
 
     async def collect(part: ExtendedPart) -> None:
         streamed.append(part)
 
-    async with running_app(make_app(handler)) as http:
+    async with running_app(make_app(Executor())) as http:
         result = await call_agent_result(BASE_URL, "hello", emit=collect, http_client=http)
 
     assert result.status == ExtendedTaskState.COMPLETED
@@ -46,20 +52,20 @@ async def test_normal_task_lifecycle_round_trips_every_part_type(make_app):
     assert [p.data.data_content.text for p in streamed if p.data] == ["looking it up"]
 
 
-async def test_task_is_enqueued_before_the_first_status_event(make_app):
-    """The framework raises InvalidAgentResponseError if a status event
-    arrives before the Task exists. ExtendedTaskUpdater._ensure_task() is
-    what prevents that, and this is the only test that can prove it: the
-    unit tests assert we enqueue a Task first, but only the real
-    EventConsumer enforces that it matters."""
+async def test_task_is_enqueued_before_the_first_event(make_app):
+    """The framework raises InvalidAgentResponseError if a status/artifact
+    event arrives before the Task exists. AgentExecutor's lazy `ensure_task()`
+    is what prevents that for every TaskEvent branch, and this is the only
+    test that can prove it against the real EventConsumer — not just that we
+    enqueue a Task first, but that the framework accepts what we send."""
 
-    async def handler(context, event_queue):
-        from a2a_utility.server import ExtendedTaskUpdater
+    class Executor(DomainAgentExecutorPort):
+        async def execute(self, context):
+            # A single artifact, nothing else — no separate "start work"
+            # concept exists anymore, so this is the minimal event stream.
+            yield PublishArtifact(parts=[ExtendedPart.from_text("done")])
 
-        # No explicit Task enqueue anywhere — straight to a status update.
-        await ExtendedTaskUpdater(context, event_queue).complete("done")
-
-    async with running_app(make_app(handler)) as http:
+    async with running_app(make_app(Executor())) as http:
         result = await call_agent_result(BASE_URL, "hi", http_client=http)
 
     assert result.status == ExtendedTaskState.COMPLETED
@@ -70,33 +76,27 @@ async def test_handler_exception_surfaces_as_a_failed_task_with_the_reason(make_
     AgentExecutor's safety net is what carries the reason back to the caller,
     which is the whole justification for keeping it."""
 
-    async def handler(context, event_queue):
-        raise ValueError("something specific broke")
+    class Executor(DomainAgentExecutorPort):
+        async def execute(self, context):
+            raise ValueError("something specific broke")
+            yield  # pragma: no cover — makes this an async generator
 
-    async with running_app(make_app(handler)) as http:
+    async with running_app(make_app(Executor())) as http:
         with pytest.raises(A2ACallError, match="something specific broke"):
             await call_agent(BASE_URL, "hi", http_client=http)
 
 
 async def test_message_mode_reply_reaches_the_caller(make_app):
     """The agent answers with a standalone Message and never creates a Task.
-    This path was silently dropped end to end: enqueue_event rejected the
-    Message for having no task_id, and the client had no branch for
-    StreamResponse.message even if it had gone out."""
+    Yielding MessageReply first (and only) is what keeps the Task from ever
+    being built — a domain agent never touches enqueue_event or any native
+    a2a.types object to make this happen."""
 
-    async def handler(context, event_queue):
-        from a2a_utility.schema import ExtendedMessage, MessageRole
+    class Executor(DomainAgentExecutorPort):
+        async def execute(self, context):
+            yield MessageReply("immediate answer")
 
-        reply = ExtendedMessage(
-            role=MessageRole.AGENT,
-            parts=[ExtendedPart.from_text("immediate answer")],
-            message_id="reply-1",
-        )
-        # enqueue_message, not enqueue_event(reply.to_protobuf()) — the
-        # handler never touches a native a2a.types object.
-        await event_queue.enqueue_message(reply)
-
-    async with running_app(make_app(handler)) as http:
+    async with running_app(make_app(Executor())) as http:
         result = await call_agent_result(BASE_URL, "hi", http_client=http)
 
     assert result.is_message_mode
@@ -110,19 +110,15 @@ async def test_input_required_resume_continues_the_same_task(make_app):
     Exercises `call_agent_result(..., task_id=...)` end to end: first call
     pauses with INPUT_REQUIRED, second call (same task_id) completes it."""
 
-    async def handler(context, event_queue):
-        from a2a_utility.server import ExtendedTaskUpdater
+    class Executor(DomainAgentExecutorPort):
+        async def execute(self, context):
+            if not context.is_resuming:
+                yield InputRequired("what city?")
+                return
+            city = context.get_user_input()
+            yield PublishArtifact(parts=[ExtendedPart.from_text(f"weather in {city}: sunny")])
 
-        tu = ExtendedTaskUpdater(context, event_queue)
-        await tu.start_work()
-        if not context.is_resuming:
-            await tu.requires_input("what city?")
-            return
-        city = context.get_user_input()
-        await tu.add_artifact([ExtendedPart.from_text(f"weather in {city}: sunny")])
-        await tu.complete()
-
-    async with running_app(make_app(handler)) as http:
+    async with running_app(make_app(Executor())) as http:
         first = await call_agent_result(BASE_URL, "book a flight", http_client=http)
         assert first.status == ExtendedTaskState.INPUT_REQUIRED
         assert first.task_id
@@ -141,17 +137,14 @@ async def test_omitting_task_id_starts_a_fresh_task_even_after_a_pause(make_app)
     absence of the resume mechanism, not just its presence, is worth
     pinning down."""
 
-    async def handler(context, event_queue):
-        from a2a_utility.server import ExtendedTaskUpdater
+    class Executor(DomainAgentExecutorPort):
+        async def execute(self, context):
+            if not context.is_resuming:
+                yield InputRequired("what city?")
+                return
+            yield PublishArtifact(parts=[ExtendedPart.from_text("should not reach here")])
 
-        tu = ExtendedTaskUpdater(context, event_queue)
-        await tu.start_work()
-        if not context.is_resuming:
-            await tu.requires_input("what city?")
-            return
-        await tu.complete("should not reach here")
-
-    async with running_app(make_app(handler)) as http:
+    async with running_app(make_app(Executor())) as http:
         first = await call_agent_result(BASE_URL, "book a flight", http_client=http)
         second = await call_agent_result(BASE_URL, "boston", http_client=http)
 
@@ -160,8 +153,36 @@ async def test_omitting_task_id_starts_a_fresh_task_even_after_a_pause(make_app)
     assert second.task_id != first.task_id
 
 
+async def test_auth_required_pauses_the_task(make_app):
+    class Executor(DomainAgentExecutorPort):
+        async def execute(self, context):
+            yield AuthRequired("please authenticate")
+
+    async with running_app(make_app(Executor())) as http:
+        result = await call_agent_result(BASE_URL, "hi", http_client=http)
+
+    assert result.status == ExtendedTaskState.AUTH_REQUIRED
+
+
+async def test_rejected_ends_the_task(make_app):
+    class Executor(DomainAgentExecutorPort):
+        async def execute(self, context):
+            yield Rejected("not allowed")
+            yield PublishArtifact(parts=[ExtendedPart.from_text("unreachable")])
+
+    async with running_app(make_app(Executor())) as http:
+        with pytest.raises(A2ACallError, match="not allowed"):
+            await call_agent(BASE_URL, "hi", http_client=http)
+
+
+class _NeverCalled(DomainAgentExecutorPort):
+    async def execute(self, context):
+        raise AssertionError("execute() should not run for a card-only request")
+        yield  # pragma: no cover
+
+
 async def test_agent_card_is_served_at_the_well_known_path(make_app):
-    async with running_app(make_app(lambda c, q: None)) as http:
+    async with running_app(make_app(_NeverCalled())) as http:
         response = await http.get("/.well-known/agent-card.json")
 
     assert response.status_code == 200
@@ -177,13 +198,12 @@ async def test_shutdown_drains_the_request_handler(make_app):
     missing aclose() shows up as a lingering task."""
     import asyncio
 
-    async def handler(context, event_queue):
-        from a2a_utility.server import ExtendedTaskUpdater
-
-        await ExtendedTaskUpdater(context, event_queue).complete("done")
+    class Executor(DomainAgentExecutorPort):
+        async def execute(self, context):
+            yield PublishArtifact(parts=[ExtendedPart.from_text("done")])
 
     before = len(asyncio.all_tasks())
-    async with running_app(make_app(handler)) as http:
+    async with running_app(make_app(Executor())) as http:
         await call_agent(BASE_URL, "hi", http_client=http)
 
     # Give cancelled tasks a tick to actually finish unwinding.

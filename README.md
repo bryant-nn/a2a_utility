@@ -23,9 +23,6 @@ a2a_utility/
 pip install -e /path/to/a2a_utility[server]        # 寫 domain agent
 pip install -e /path/to/a2a_utility[client]        # 寫 coordinator
 pip install -e /path/to/a2a_utility[server,client] # 兩者都要
-
-pip install -e /path/to/a2a_utility[server,auth]   # 要用內建 JWT 驗證（PyJWT）
-pip install -e /path/to/a2a_utility[server,fastapi] # 要掛進既有 FastAPI 服務
 ```
 
 ---
@@ -34,29 +31,31 @@ pip install -e /path/to/a2a_utility[server,fastapi] # 要掛進既有 FastAPI �
 
 ### 寫一個 domain agent
 
-一個 async function 就是一個 agent：
+繼承 `DomainAgentExecutorPort`，`execute()` 是一個 async generator：yield typed event 驅動 task，
+`return` 就是成功、`raise` 就是失敗：
 
 ```python
+from typing import AsyncIterator
+
 from a2a_utility.server import (
-    ExtendedAgentCard, ExtendedAgentSkill, ExtendedEventQueue,
-    ExtendedRequestContext, ExtendedTaskUpdater, serve_as_a2a,
+    DomainAgentExecutorPort, ExtendedAgentCard, ExtendedAgentSkill,
+    ExtendedRequestContext, Progress, PublishArtifact, TaskEvent, serve_as_a2a,
 )
-from a2a_utility.schema import ExtendedPart, as_thinking_emitter
+from a2a_utility.schema import ExtendedPart
 
 
-async def handle(context: ExtendedRequestContext, event_queue: ExtendedEventQueue) -> None:
-    task_updater = ExtendedTaskUpdater(context, event_queue)
-    await task_updater.start_work()
+class JokeAgent(DomainAgentExecutorPort):
+    async def execute(self, context: ExtendedRequestContext) -> AsyncIterator[TaskEvent]:
+        yield Progress("thinking of a joke...")            # 串流進度／思考過程
 
-    emit = as_thinking_emitter(task_updater.as_part_emitter())   # 串流思考過程
-    answer = await my_business_logic(context.get_user_input(), emit)
+        answer = await my_business_logic(context.get_user_input())
 
-    await task_updater.add_artifact([ExtendedPart.from_text(answer)])
-    await task_updater.complete()
+        yield PublishArtifact(parts=[ExtendedPart.from_text(answer)])
+        # 不用叫 complete() —— generator 正常跑完就是成功
 
 
 serve_as_a2a(
-    handler=handle,
+    executor=JokeAgent(),
     card=ExtendedAgentCard(
         name="joke_agent",
         description="說笑話",
@@ -67,11 +66,9 @@ serve_as_a2a(
 )
 ```
 
-`handle()` 的形狀是原生 `AgentExecutor.execute(context, event_queue) -> None` 的逐參數鏡射。沒有回傳值 ——
-**task 的結局由你呼叫哪個方法決定**，跟原生一樣，連 `start_work()` 都要自己送。
-
-想讓業務邏輯完全不碰 A2A，就照這個 repo 的慣例：`agent.py` 放純 `async def handle(text, emit) -> str`，
-`server.py` 只做上面那層薄轉接。
+`execute()` 完全不碰 task 生命週期的機制（`TaskUpdater`／`EventQueue`／任何 `a2a.*`）—— 那些全部由
+a2a_utility 內部處理，你只需要 yield「發生了什麼事」。想讓業務邏輯完全不碰 A2A，就照這個 repo 的慣例：
+`agent.py` 放純 `async def run(text) -> str`，`server.py` 只做上面那層薄轉接。
 
 ### 寫一個 coordinator
 
@@ -96,29 +93,35 @@ async with ExtendedAgentClient(base_url) as agent:
 
 ## Task 狀態怎麼決定
 
-`ExtendedTaskUpdater` 是原生 `TaskUpdater` 的真子類別，方法一一對應，但**參數全部是 a2a_utility 的型別**：
+`execute()` yield 什麼 `TaskEvent`，task 就變成什麼狀態——**不用自己管 `TaskUpdater`／`EventQueue`**：
 
-| 方法 | 結果 | 什麼時候用 |
+| yield | 結果 | 什麼時候用 |
 |---|---|---|
-| `start_work()` | WORKING | 開始做事 |
-| `add_artifact([...])` | — | 產出答案，可呼叫多次（串流分段用 `append`/`last_chunk`） |
-| `complete()` | COMPLETED（終態） | 成功 |
-| `failed()` | FAILED（終態） | 壞掉了 |
-| `reject()` | REJECTED（終態） | 拒絕服務（權限不足） |
-| `cancel()` | CANCELED（終態） | 放棄 |
-| `requires_input()` | INPUT_REQUIRED（暫停） | 需要使用者補資料 |
-| `requires_auth()` | AUTH_REQUIRED（暫停） | 需要憑證 |
+| `Progress(message)` | WORKING | 串流進度／思考過程，可以 yield 多次 |
+| `PublishArtifact(parts=[...])` | — | 產出答案，可呼叫多次（串流分段用 `append`/`last_chunk`） |
+| （generator 正常跑完） | COMPLETED（終態） | 成功——不用自己 yield 任何東西促成 |
+| （`raise`） | FAILED（終態） | 壞掉了，例外訊息會保留在 task 的 `status_message` 上 |
+| `Rejected(message)` | REJECTED（終態） | 拒絕服務（權限不足），之後 `return` |
+| `InputRequired(message)` | INPUT_REQUIRED（暫停） | 需要使用者補資料，之後 `return` |
+| `AuthRequired(message)` | AUTH_REQUIRED（暫停） | 需要憑證，之後 `return` |
+| `MessageReply(message)` | message-mode（不建立 Task） | 立即回覆、不需要完整 task 生命週期，必須是唯一 yield 的事件 |
 
-所有 `message=` 參數都吃四種形狀，**不用自己建 message 物件**：
+`cancel()` 是可選的 override，回傳值是要附在 CANCELED 狀態上的自訂訊息（不覆寫就是 `None`，task 一律
+會被標成 CANCELED——覆寫只影響訊息內容，不影響「有沒有被取消」）：
 
 ```python
-await task_updater.complete("done")                              # str
-await task_updater.complete(ExtendedPart.from_text("done"))      # 一個 part
-await task_updater.complete([ExtendedPart.thinking("...")])      # 一串 parts
-await task_updater.complete(task_updater.new_agent_message([...]))  # ExtendedMessage
+class MyAgent(DomainAgentExecutorPort):
+    async def execute(self, context): ...
+
+    async def cancel(self, context) -> str | None:
+        await release_my_resources()
+        return "cleaned up before stopping"
 ```
 
-暫停之後框架會用**一次全新的 `execute()`**（同一個 task_id，不是接續舊 coroutine）把後續回答帶進來。
+所有 `message=` 參數都吃 `MessageLike`（四種形狀，**不用自己建 message 物件**）：`str`／
+`ExtendedPart`／`list[ExtendedPart]`／`ExtendedMessage`。
+
+暫停之後框架會用**一次全新的 `execute()`**（同一個 task_id，不是接續舊 generator）把後續回答帶進來。
 用 `context.is_resuming` 判斷，用 `context.current_task` 讀先前的狀態與歷史。
 
 **但這件事需要 caller 配合**：續傳靠的是 caller 把下一次請求的 `task_id` 設成跟上次一樣，server 才會
@@ -154,12 +157,12 @@ if result.status == ExtendedTaskState.INPUT_REQUIRED:
 ## 上線相關
 
 `create_app()` / `serve_as_a2a()` **刻意不收任何 production 注入參數**，只有 `mode` / `agent_card` /
-`handler` / `on_cancel` / `registry_url` / `registration_payload` / `rpc_url`。需要更多的時候：
+`executor` / `registry_url` / `registration_payload` / `rpc_url`。需要更多的時候：
 
 **掛 middleware、加 route** —— `create_app()` 回傳的就是一個普通 Starlette app，用 Starlette 自己的 API：
 
 ```python
-app = create_app(agent_card=card, handler=handle)
+app = create_app(agent_card=card, executor=JokeAgent())
 app.add_middleware(MyMiddleware)
 app.router.routes.append(Route("/health", health))
 serve(app, host=card.host, port=card.port)
@@ -174,22 +177,23 @@ serve(app, host=card.host, port=card.port)
 ```python
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
-from a2a_utility.server import AgentExecutor, A2AUtilityCallContextBuilder
+from a2a.server.routes.common import DefaultServerCallContextBuilder
+from a2a_utility.server import AgentExecutor
 
 proto_card = card.to_agent_card()
 request_handler = DefaultRequestHandler(
-    agent_executor=AgentExecutor(handler=handle),   # ← handler 合約完全不變
+    agent_executor=AgentExecutor(executor=JokeAgent()),   # ← DomainAgentExecutorPort 合約完全不變
     task_store=DatabaseTaskStore(...),
     agent_card=proto_card,
     push_config_store=..., push_sender=...,
 )
 routes = [*create_agent_card_routes(proto_card),
           *create_jsonrpc_routes(request_handler, "/",
-                                 context_builder=A2AUtilityCallContextBuilder())]
+                                 context_builder=DefaultServerCallContextBuilder())]
 app = Starlette(routes=routes)   # lifespan 記得接 request_handler.aclose()
 ```
 
-domain agent 那支 `handle()` 一個字都不用改 —— 換掉的只有組 app 這層。
+domain agent 那個 `DomainAgentExecutorPort` 子類別一個字都不用改 —— 換掉的只有組 app 這層。
 
 ---
 
@@ -242,8 +246,10 @@ pytest
 - **DISCOVERY 的 `/register` 是手刻解析**，錯誤訊息只有一個手寫的 400。
 - **`DiscoveryClient.search()` 沒有實際呼叫端**：`rank_agents()` 已經可用，但兩個 coordinator demo
   還是 `list_agents()` 列全部讓 LLM 自己選。
-- **例外安全網不是 100% 乾淨**：handler 自己送過終態後才拋例外的話，安全網那個 throwaway instance
-  不知道，會多送一則狀態（無害但多餘）。
+- **外部 cancel 跟 execute() 自然結束可能競速**：兩者是框架獨立呼叫的兩個入口，各自建自己的
+  `TaskUpdater`，一個不知道另一個已經送過終態——如果 execute() 剛好在 cancel RPC 抵達前就已經
+  COMPLETED，cancel() 還是會多送一則 CANCELED（無害但多餘）。這是原生本身的限制，不是這個 wrapper
+  引入的。
 
 ---
 

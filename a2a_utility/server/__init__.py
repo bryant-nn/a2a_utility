@@ -1,110 +1,87 @@
 """a2a_utility.server — a thin typed wrapper over the native a2a-sdk.
 
-Domain agents write ONE plain callable — an AgentHandlerPort:
-`async def handle(context: ExtendedRequestContext, event_queue: ExtendedEventQueue) -> None`
-(a bare function for stateless agents, or an object with `__call__` for agents
-that want to hold construction state) — and hand it to `serve_as_a2a(handler=...)`.
-No a2a_utility class to import or subclass: `AgentExecutor` (adapters/inbound/
-agent_executor.py) is a real, unmodified subclass of the native a2a-sdk ABC,
-built internally around the injected handler, the same way discovery mode's
-DiscoveryAgentExecutor is constructor-injected with a DiscoveryUseCasePort
-rather than subclassed per agent.
+Domain agents write a class subclassing `DomainAgentExecutorPort`:
 
-This mirrors writing a native `AgentExecutor.execute(context, event_queue) ->
-None` directly, parameter for parameter: native hands the implementer the raw
-`EventQueue`, not a pre-built `TaskUpdater` — building one is the
-implementer's own choice, not something the framework decides. A domain
-agent that wants `TaskUpdater`-level convenience builds
-`ExtendedTaskUpdater(context, event_queue)` itself, as its own first line,
-exactly like a native implementation would build a `TaskUpdater` itself:
+    class MyAgent(DomainAgentExecutorPort):
+        async def execute(self, context: ExtendedRequestContext):
+            yield Progress("thinking...")
+            answer = await run_my_agent(context.get_user_input())
+            yield PublishArtifact(parts=[ExtendedPart.from_text(answer)])
 
-    async def handle(context, event_queue):
-        task_updater = ExtendedTaskUpdater(context, event_queue)
-        await task_updater.start_work()
-        answer = await run_my_agent(context.get_user_input())
-        await task_updater.add_artifact([ExtendedPart.from_text(answer)])
-        await task_updater.complete()
+and hand an instance to `serve_as_a2a(executor=MyAgent())`. `execute()` is an
+async generator: yield `TaskEvent` values to drive the task, `return` to
+complete it, `raise` to fail it (the exception's message is preserved on the
+wire). Override `cancel()` only to attach a custom message to an externally
+requested CANCELED — real cleanup doesn't need it, since the asyncio task
+running `execute()` is cancelled by the framework independently and a
+handler's own try/finally already runs.
 
-`ExtendedTaskUpdater` is a real subclass of native `TaskUpdater` (not a
-wrapper) — `isinstance(tu, TaskUpdater)` is True, and the id generation,
-terminal-state guard, and event construction underneath are native's own.
-Every public method is nonetheless an explicit override, for the typed
-boundary this package holds: native's signatures speak protobuf
-(`update_status` takes an int-valued `TaskState`, every `message=` takes an
-`a2a.types.Message`, `add_artifact` takes `list[Part]`), so inheriting any of
-them unchanged would put a native type back in a handler's face.
-`ExtendedTaskUpdater`'s versions take `ExtendedTaskState`/`list[ExtendedPart]`
-instead, and every `message=` accepts a plain `str`, an `ExtendedPart`, a
-`list[ExtendedPart]`, or an `ExtendedMessage` — no message-construction
-ritual to attach a note to a status. `add_artifact`/`new_agent_message` also
-catch a real native footgun (the `Part` proto's oneof silently keeps
-whichever of text/raw/url/data was set last instead of raising). There is no
-declarative return-value contract to learn (no HandlerResult) — the domain
-agent decides how the task ends by which method it calls, exactly like
-native usage.
+This is a deliberate departure from this package's other ports
+(`DiscoveryUseCasePort` is a `Protocol`, no inheritance required) — a real
+ABC, subclassed. An earlier shape (`AgentHandlerPort`, a plain callable
+imperatively driving `ExtendedTaskUpdater`/`ExtendedEventQueue`) held to "no
+forced inheritance"; this replaces it entirely, because the declarative shape
+needs somewhere to hang a default `cancel()`. `ExtendedTaskUpdater` and
+`ExtendedEventQueue` are gone along with it — nothing else called them once
+`agent_executor.py` stopped, so keeping them around would have been orphaned
+code. `adapters/inbound/agent_executor.py` (the one class that reads what a
+domain agent yields) drives native `TaskUpdater`/`EventQueue` directly; see
+`docs/DESIGN.md` for the full reasoning, including why that's safe (the
+Task-before-status-event ordering, the cancel-before-any-Task edge case, and
+`MessageLike` coercion all moved into `adapters/inbound/_native_task.py`,
+shared with DISCOVERY mode's `DiscoveryAgentExecutor`, instead of being
+reimplemented twice).
 
-`AgentExecutor.execute()` does NOT auto-send the initial WORKING status or
-check whether the handler ever reached a terminal state — native doesn't do
-either, so this class holds handlers to exactly the same expectations native
-does. The one thing it adds beyond pure pass-through: uncaught exceptions
-become a FAILED status *carrying the error text* (via a throwaway
-`ExtendedTaskUpdater` built in the except block). Under a2a-sdk 1.1.2 the
-framework does mark the task FAILED by itself (`ActiveTask._run_producer`
-and `EventConsumer.run` both catch), but it sends a bare status with no
-message; this layer exists so the caller learns *what* failed.
+`AgentExecutor` (this module's own inbound adapter) does NOT auto-send the
+initial WORKING status or check whether the domain generator ever reached a
+terminal state — native doesn't do either, so a domain agent is held to
+exactly the same expectations native usage would be. The one thing it adds
+beyond mapping typed events onto native calls: uncaught exceptions become a
+FAILED status *carrying the error text*. Under a2a-sdk 1.1.2 the framework
+does mark the task FAILED by itself (`ActiveTask._run_producer` and
+`EventConsumer.run` both catch), but it sends a bare status with no message;
+this layer exists so the caller learns *what* failed.
 
-`ExtendedEventQueue` exposes two methods. `enqueue_message(ExtendedMessage)`
-is the one a handler should reach for: it publishes a standalone reply —
+`MessageReply` is the one `TaskEvent` that skips Task creation entirely —
 native's other "immediate response" workflow, answering without ever
-creating a `Task` at all — and takes and needs nothing from `a2a.*`.
-`enqueue_event(Event)` is the advanced escape hatch underneath it, mirroring
-the native `EventQueue` ABC directly (whose docstring is explicit that it is
-the producer-side interface and that the consumer half — `dequeue_event`/
-`tap`/`close` — is framework-managed and not public); using it directly means
-holding a native `a2a.types` object yourself, which `ExtendedTaskUpdater`
-already does correctly for `Task`/`TaskStatusUpdateEvent`/
-`TaskArtifactUpdateEvent`. Both validate eagerly that a published event's
-`task_id` matches this request's — native rejects the mismatch deep in
-`a2a.server.tasks.task_manager.TaskManager`, outside any exception handler
-reachable from a handler, so a catchable `ValueError` is raised first here
-instead. Events carrying no task id at all (the standalone message case) are
-exempt.
-
-Neither `ExtendedEventQueue` nor `ExtendedTaskUpdater` exposes the
-underlying native object via a `.native`-style escape hatch — a domain
-agent's code never imports anything from `a2a.*`.
+creating a `Task` at all. It must be the only event yielded: the Task is
+built lazily, on the first event that actually needs one, which is what
+makes this possible.
 
 Public surface:
   - Composition:   ExtendedAgentCard, ExtendedAgentSkill, ExtendedAgentProvider,
                    create_app, serve, serve_as_a2a (mode=AGENT|DISCOVERY)
-  - Handler contract: AgentHandlerPort, OnCancelPort, ExtendedRequestContext
-  - Task-driving objects: ExtendedEventQueue, ExtendedTaskUpdater, MessageLike
+  - Executor contract: DomainAgentExecutorPort, ExtendedRequestContext
+  - Typed events (what execute() yields): TaskEvent, Progress, PublishArtifact,
+                   InputRequired, AuthRequired, Rejected, MessageReply
   - Data contract: ExtendedPart, ExtendedArtifact, ExtendedMessage, MessageRole,
-                   ExtendedTask, ExtendedTaskState, A2ATaskResult,
+                   ExtendedTask, ExtendedTaskState, A2ATaskResult, MessageLike,
                    VercelThinkingResponse, SourceReferenceResponse, CustomizedData,
                    PartEmitter, as_thinking_emitter (re-exported from a2a_utility.schema)
-  - Context builder: A2AUtilityCallContextBuilder — the builder `create_app`
-                   always uses; subclass it only when composing your own app
-                   (see that module's docstring).
   - Standalone:    run_agent_server, run_discovery_server, ServerMode, A2ASettings
-  - Native re-exports: IDGenerator — the one type a caller needs to *name* in
-                   order to pass `message_id_generator=` to `ExtendedTaskUpdater`
-                   or `AgentExecutor`. Nothing else native is re-exported:
-                   `RequestContext`/`EventQueue` used to be, which quietly told
-                   handlers the protobuf types were fair game.
+  - Native re-export: IDGenerator — the one type a caller needs to *name* in
+                   order to pass `message_id_generator=` to `AgentExecutor`.
+                   Nothing else native is re-exported: `RequestContext`/
+                   `EventQueue` used to be, which quietly told handlers the
+                   protobuf types were fair game.
 """
 
 from a2a.server.id_generator import IDGenerator
 
 from .adapters.inbound.agent_executor import AgentExecutor
-from .adapters.inbound.call_context_builder import A2AUtilityCallContextBuilder
-from .adapters.outbound.event_queue_adapter import ExtendedEventQueue
-from .adapters.outbound.task_updater_adapter import ExtendedTaskUpdater, MessageLike
 from .app import create_app, serve, serve_as_a2a
 from .card import ExtendedAgentCard, ExtendedAgentProvider, ExtendedAgentSkill
 from .application.dtos import ExtendedRequestContext
-from .application.ports.inbound.agent_handler_port import AgentHandlerPort
-from .application.ports.inbound.on_cancel_port import OnCancelPort
+from .application.ports.inbound.domain_agent_executor_port import DomainAgentExecutorPort
+from .domain.models.task_events import (
+    AuthRequired,
+    InputRequired,
+    MessageReply,
+    Progress,
+    PublishArtifact,
+    Rejected,
+    TaskEvent,
+)
 from .config import A2ASettings, ServerMode
 from ..schema import (
     A2ATaskResult,
@@ -114,6 +91,7 @@ from ..schema import (
     ExtendedPart,
     ExtendedTask,
     ExtendedTaskState,
+    MessageLike,
     MessageRole,
     PartEmitter,
     SourceReferenceResponse,
@@ -130,18 +108,22 @@ __all__ = [
     "create_app",
     "serve",
     "serve_as_a2a",
-    # handler contract
-    "AgentHandlerPort",
-    "OnCancelPort",
+    # executor contract
+    "DomainAgentExecutorPort",
     "ExtendedRequestContext",
-    # task-driving objects
-    "ExtendedEventQueue",
-    "ExtendedTaskUpdater",
-    "MessageLike",
+    # typed events (what execute() yields)
+    "TaskEvent",
+    "Progress",
+    "PublishArtifact",
+    "InputRequired",
+    "AuthRequired",
+    "Rejected",
+    "MessageReply",
     # data contract
     "ExtendedPart",
     "ExtendedArtifact",
     "ExtendedMessage",
+    "MessageLike",
     "MessageRole",
     "ExtendedTask",
     "ExtendedTaskState",
@@ -151,8 +133,6 @@ __all__ = [
     "CustomizedData",
     "PartEmitter",
     "as_thinking_emitter",
-    # context builder extension point
-    "A2AUtilityCallContextBuilder",
     # standalone nodes
     "run_agent_server",
     "run_discovery_server",

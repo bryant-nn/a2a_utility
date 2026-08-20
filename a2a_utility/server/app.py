@@ -1,13 +1,13 @@
 """Composition helpers: build_agent_card / create_app / serve / serve_as_a2a.
 
-A domain agent hands create_app a plain AgentHandlerPort callable (a function,
-or an object with __call__ — see application/ports/inbound/agent_handler_port.py)
-together with an AgentCard, mode=ServerMode.AGENT (the default). create_app
-builds adapters/inbound/agent_executor.py's AgentExecutor around that handler
-and wires the native a2a request handler + routes. A domain agent never
-imports AgentExecutor itself — only this module and application.dtos/
-application.ports.inbound.agent_handler_port. serve_as_a2a is the one-call
-convenience that also builds the card and runs uvicorn with registry
+A domain agent hands create_app a `DomainAgentExecutorPort` instance (see
+application/ports/inbound/domain_agent_executor_port.py) together with an
+AgentCard, mode=ServerMode.AGENT (the default). create_app builds
+adapters/inbound/agent_executor.py's AgentExecutor around that instance and
+wires the native a2a request handler + routes. A domain agent never imports
+AgentExecutor itself — only this module and application.dtos/
+application.ports.inbound.domain_agent_executor_port. serve_as_a2a is the
+one-call convenience that also builds the card and runs uvicorn with registry
 self-registration (heartbeat).
 
 Passing mode=ServerMode.DISCOVERY instead builds a zero-LLM registry node in
@@ -33,6 +33,7 @@ from a2a.server.routes import (
     create_agent_card_routes,
     create_jsonrpc_routes,
 )
+from a2a.server.routes.common import DefaultServerCallContextBuilder
 from a2a.server.tasks import InMemoryTaskStore
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -40,11 +41,9 @@ from starlette.responses import JSONResponse
 from starlette.routing import BaseRoute, Route
 
 from .adapters.inbound.agent_executor import AgentExecutor
-from .adapters.inbound.call_context_builder import A2AUtilityCallContextBuilder
 from .adapters.inbound.discovery_agent_executor import DiscoveryAgentExecutor
 from .adapters.outbound.in_memory_registry_adapter import InMemoryRegistryAdapter
-from .application.ports.inbound.agent_handler_port import AgentHandlerPort
-from .application.ports.inbound.on_cancel_port import OnCancelPort
+from .application.ports.inbound.domain_agent_executor_port import DomainAgentExecutorPort
 from .application.use_cases.register_agent_card_use_case import RegisterAgentCardUseCase
 from .application.use_cases.search_agent_use_case import SearchAgentUseCase
 from .card import ExtendedAgentCard
@@ -164,7 +163,7 @@ def _create_discovery_app(
         task_store=InMemoryTaskStore(),
         agent_card=proto_card,
     )
-    context_builder = A2AUtilityCallContextBuilder()
+    context_builder = DefaultServerCallContextBuilder()
 
     routes: list[Route] = [
         Route("/register", register, methods=["POST"]),
@@ -186,8 +185,7 @@ def create_app(
     *,
     mode: ServerMode = ServerMode.AGENT,
     agent_card: ExtendedAgentCard,
-    handler: Optional[AgentHandlerPort] = None,
-    on_cancel: Optional[OnCancelPort] = None,
+    executor: Optional[DomainAgentExecutorPort] = None,
     registry_url: Optional[str] = None,
     registration_payload: Optional[dict] = None,
     rpc_url: str = "/",
@@ -197,15 +195,15 @@ def create_app(
     Takes an `ExtendedAgentCard` and converts it to the native protobuf card
     internally, so a caller never handles `a2a.types.AgentCard` directly.
 
-    mode=AGENT (default): wraps a domain agent's `handler` (required — a plain
-    AgentHandlerPort callable, not an AgentExecutor) behind the native a2a
-    request handler. `on_cancel` reacts to an externally requested
-    cancellation; most agents don't need it (the default marks the task
-    CANCELED).
+    mode=AGENT (default): wraps a domain agent's `executor` (required — a
+    `DomainAgentExecutorPort` instance, not an AgentExecutor) behind the
+    native a2a request handler. Override `DomainAgentExecutorPort.cancel()`
+    only to attach a custom message to an externally requested cancellation;
+    most agents don't need it (the default marks the task CANCELED with no
+    message).
 
-    mode=DISCOVERY: `handler`/`on_cancel` are not used (a registry node has no
-    LLM/domain logic of its own) — see _create_discovery_app for what gets
-    wired instead.
+    mode=DISCOVERY: `executor` is not used (a registry node has no LLM/domain
+    logic of its own) — see _create_discovery_app for what gets wired instead.
 
     This deliberately takes no production-injection arguments. What to do
     instead:
@@ -221,22 +219,22 @@ def create_app(
     restart and nothing is shared across replicas.
 
     Raises:
-      ValueError: mode=AGENT with no `handler`.
+      ValueError: mode=AGENT with no `executor`.
     """
     if mode == ServerMode.DISCOVERY:
         return _create_discovery_app(agent_card=agent_card, rpc_url=rpc_url)
 
-    if handler is None:
-        raise ValueError("create_app(mode=AGENT) requires a `handler`")
+    if executor is None:
+        raise ValueError("create_app(mode=AGENT) requires an `executor`")
 
     proto_card = agent_card.to_agent_card()
     request_handler = DefaultRequestHandler(
-        agent_executor=AgentExecutor(handler=handler, on_cancel=on_cancel),
+        agent_executor=AgentExecutor(executor=executor),
         task_store=InMemoryTaskStore(),
         agent_card=proto_card,
     )
 
-    builder = A2AUtilityCallContextBuilder()
+    builder = DefaultServerCallContextBuilder()
     routes: list[BaseRoute] = list(create_agent_card_routes(proto_card))
     routes.extend(create_jsonrpc_routes(request_handler, rpc_url, context_builder=builder))
 
@@ -254,8 +252,7 @@ def serve(app: Starlette, *, host: str = "127.0.0.1", port: int) -> None:
 def serve_as_a2a(
     *,
     card: ExtendedAgentCard,
-    handler: Optional[AgentHandlerPort] = None,
-    on_cancel: Optional[OnCancelPort] = None,
+    executor: Optional[DomainAgentExecutorPort] = None,
     mode: ServerMode = ServerMode.AGENT,
     registry_url: Optional[str] = None,
 ) -> None:
@@ -267,13 +264,12 @@ def serve_as_a2a(
     — all the a2a boilerplate (version, modes, capabilities, JSONRPC
     interface) is filled internally. host/port come from the card.
 
-    mode=AGENT (default): `handler` (required) is a domain-agent-authored
-    AgentHandlerPort — a plain async function, or an object with __call__ if
-    the agent wants to hold construction state. If registry_url is given,
-    self-registers {name, description, agent_card_url} and heartbeats.
+    mode=AGENT (default): `executor` (required) is an instance of a domain-
+    agent-authored `DomainAgentExecutorPort` subclass. If registry_url is
+    given, self-registers {name, description, agent_card_url} and heartbeats.
 
-    mode=DISCOVERY: `handler`/`on_cancel`/`registry_url` are ignored (a
-    registry node doesn't self-register or run any handler).
+    mode=DISCOVERY: `executor`/`registry_url` are ignored (a registry node
+    doesn't self-register or run any executor).
 
     This is the shortest path and nothing more. Anything that needs to touch
     the app before it runs — middleware, extra routes, a durable task store —
@@ -285,8 +281,8 @@ def serve_as_a2a(
         serve(app, host=card.host, port=card.port)
         return
 
-    if handler is None:
-        raise ValueError("serve_as_a2a(mode=AGENT) requires a `handler`")
+    if executor is None:
+        raise ValueError("serve_as_a2a(mode=AGENT) requires an `executor`")
 
     registration_payload = {
         "name": card.name,
@@ -295,8 +291,7 @@ def serve_as_a2a(
     }
     app = create_app(
         mode=mode,
-        handler=handler,
-        on_cancel=on_cancel,
+        executor=executor,
         agent_card=card,
         registry_url=registry_url,
         registration_payload=registration_payload,

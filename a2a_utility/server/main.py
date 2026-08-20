@@ -3,44 +3,42 @@
     A2A_SERVER_MODE=AGENT      python -m a2a_utility.server.main
     A2A_SERVER_MODE=DISCOVERY  python -m a2a_utility.server.main
 
-AGENT mode runs a demo AgentHandlerPort emitting typed ExtendedParts (text +
-thinking + source_reference). DISCOVERY mode is the zero-LLM registry node
-(REST /register + /agents, plus an A2A "who can do X?" search endpoint).
+AGENT mode runs a demo DomainAgentExecutorPort emitting typed ExtendedParts
+(text + thinking + source_reference). DISCOVERY mode is the zero-LLM registry
+node (REST /register + /agents, plus an A2A "who can do X?" search endpoint).
 
-Real domain agents don't use this file — they write their own AgentHandlerPort
-callable and call `serve_as_a2a()`/`create_app()`, same as the two
-run_*_server() functions below do. It is, however, the file people copy from,
-so it holds itself to the same rule every domain agent is held to: **not one
-`a2a.*` import**. Everything it needs comes from a2a_utility.
+Real domain agents don't use this file — they subclass their own
+DomainAgentExecutorPort and call `serve_as_a2a()`/`create_app()`, same as the
+two run_*_server() functions below do. It is, however, the file people copy
+from, so it holds itself to the same rule every domain agent is held to:
+**not one `a2a.*` import**. Everything it needs comes from a2a_utility.
 """
 
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 from ..schema import ExtendedPart
 from .app import create_app, serve
 from .application.dtos import ExtendedRequestContext
-from .adapters.outbound.event_queue_adapter import ExtendedEventQueue
-from .adapters.outbound.task_updater_adapter import ExtendedTaskUpdater
+from .application.ports.inbound.domain_agent_executor_port import DomainAgentExecutorPort
+from .domain.models.task_events import Progress, PublishArtifact, TaskEvent
 from .card import ExtendedAgentCard, ExtendedAgentSkill
 from .config import A2ASettings, ServerMode
 
 
-async def _demo_handler(context: ExtendedRequestContext, event_queue: ExtendedEventQueue) -> None:
-    """Demo AgentHandlerPort — builds its own ExtendedTaskUpdater from the
-    ExtendedEventQueue it's handed, same calling convention as writing a
-    native AgentExecutor.execute()."""
-    task_updater = ExtendedTaskUpdater(context, event_queue)
-    await task_updater.start_work()
-    await task_updater.as_part_emitter()(ExtendedPart.thinking("Parsing the request..."))
-    query = context.get_user_input()
-    await task_updater.add_artifact(
-        [
-            ExtendedPart.thinking("Picked a canned demo reply."),
-            ExtendedPart.source_reference([{"source": "demo", "note": "no real data source"}]),
-            ExtendedPart.from_text(f"You said: {query!r}. This is a demo executor."),
-        ]
-    )
-    await task_updater.complete()
+class _DemoExecutor(DomainAgentExecutorPort):
+    """Demo DomainAgentExecutorPort — yields typed events instead of driving
+    a task_updater imperatively; a2a_utility maps them onto the wire."""
+
+    async def execute(self, context: ExtendedRequestContext) -> AsyncIterator[TaskEvent]:
+        yield Progress(ExtendedPart.thinking("Parsing the request..."))
+        query = context.get_user_input()
+        yield PublishArtifact(
+            parts=[
+                ExtendedPart.thinking("Picked a canned demo reply."),
+                ExtendedPart.source_reference([{"source": "demo", "note": "no real data source"}]),
+                ExtendedPart.from_text(f"You said: {query!r}. This is a demo executor."),
+            ]
+        )
 
 
 def _demo_card(settings: A2ASettings, skill: ExtendedAgentSkill) -> ExtendedAgentCard:
@@ -55,7 +53,7 @@ def _demo_card(settings: A2ASettings, skill: ExtendedAgentSkill) -> ExtendedAgen
 
 
 def run_agent_server(settings: Optional[A2ASettings] = None) -> None:
-    """AGENT mode: demo AgentHandlerPort mounted at POST /."""
+    """AGENT mode: demo DomainAgentExecutorPort mounted at POST /."""
     settings = settings or A2ASettings()  # type: ignore[call-arg]
     skill = ExtendedAgentSkill(
         id="chat",
@@ -65,7 +63,7 @@ def run_agent_server(settings: Optional[A2ASettings] = None) -> None:
     )
     app = create_app(
         mode=ServerMode.AGENT,
-        handler=_demo_handler,
+        executor=_DemoExecutor(),
         agent_card=_demo_card(settings, skill),
     )
     serve(app, host=settings.host, port=settings.port)

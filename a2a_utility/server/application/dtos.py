@@ -1,21 +1,21 @@
 """Application-layer DTO — ExtendedRequestContext, the shape
-AgentHandlerPort's first argument is expressed in.
+`DomainAgentExecutorPort.execute()`'s argument is expressed in.
 
-Wraps the native a2a RequestContext and exposes the subset of it a handler
-actually needs, converted into `a2a_utility.schema` types at the boundary:
-`.message` is an `ExtendedMessage`, `.current_task` an `ExtendedTask`. A
-handler reading either of those never touches a protobuf object, which is the
-whole point — previously both returned native `a2a.types` messages, so any
-handler that inspected the incoming turn or the prior task state was forced
-to `import a2a`.
+Wraps the native a2a RequestContext and exposes the subset of it a domain
+agent actually needs, converted into `a2a_utility.schema` types at the
+boundary: `.message` is an `ExtendedMessage`, `.current_task` an
+`ExtendedTask`. Code reading either of those never touches a protobuf
+object, which is the whole point — previously both returned native
+`a2a.types` messages, so any domain agent that inspected the incoming turn
+or the prior task state was forced to `import a2a`.
 
 The constructor still takes the native type: this IS the conversion boundary,
 the same pragmatic trade-off `schema/parts.py` makes with `a2a.types.Part`.
 
-There is no declarative task-ending result type here (no HandlerResult) — a
-handler drives `ExtendedTaskUpdater` directly and returns None, the same
-shape as writing native `AgentExecutor.execute(context, event_queue) ->
-None`. See that module's docstring for the reasoning.
+Task-ending is declarative here — `execute()` yields `domain.models.
+task_events.TaskEvent` values rather than driving a task_updater directly.
+`adapters/inbound/agent_executor.py` reads what's yielded and drives native
+`TaskUpdater`/`EventQueue`; see that module's docstring for the reasoning.
 """
 
 from __future__ import annotations
@@ -33,19 +33,6 @@ class ExtendedRequestContext:
         self._message: Optional[ExtendedMessage] = None
         self._current_task: Optional[ExtendedTask] = None
         self._current_task_read = False
-
-    @property
-    def _native(self) -> RequestContext:
-        """The wrapped native RequestContext.
-
-        Package-internal, not a domain-agent escape hatch: `ExtendedTaskUpdater`
-        needs the native context to build the initial `Task` protobuf, the same
-        way it reaches `ExtendedEventQueue._eq` for the native queue. Single
-        underscore because it is a2a_utility's own plumbing between sibling
-        classes — a handler reaching for it is working around the boundary this
-        package exists to hold, and nothing here is designed to support that.
-        """
-        return self._context
 
     def get_user_input(self, delimiter: str = "\n") -> str:
         """The incoming turn's text content, joined by `delimiter`."""

@@ -13,8 +13,8 @@ Public surface:
   - Credentials / CredentialProvider / StaticToken: what to authenticate with.
     Pass `credentials=<token>` to forward an identity to a downstream agent
     on the caller's behalf.
-  - PartEmitter: the live-streaming callback contract (the same type a
-    server-side AgentHandlerPort receives).
+  - PartEmitter: the live-streaming callback contract — pass one as `emit=`
+    to a call_agent* function or ExtendedAgentClient.send*.
   - DiscoveryClient: cached directory lookups against an a2a_utility DISCOVERY node.
 
 The typed data models (ExtendedPart, A2ATaskResult, …) live in a2a_utility.schema.

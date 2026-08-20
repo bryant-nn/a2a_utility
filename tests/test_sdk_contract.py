@@ -103,8 +103,9 @@ def test_task_updater_add_artifact_takes_parts_positionally():
 
 
 def test_agent_executor_abc_signature_is_still_context_event_queue():
-    """adapters/inbound/agent_executor.py subclasses this, and
-    AgentHandlerPort mirrors the signature parameter for parameter."""
+    """adapters/inbound/agent_executor.py subclasses this — a2a_utility's own
+    AgentExecutor must keep satisfying this exact signature to stay a real
+    native subclass."""
     for method in (AgentExecutor.execute, AgentExecutor.cancel):
         params = list(inspect.signature(method).parameters)
         assert params == ["self", "context", "event_queue"]
@@ -172,8 +173,8 @@ def test_task_state_still_has_every_state_ExtendedTaskState_maps():
 
 
 def test_default_context_builder_still_puts_raw_headers_in_state():
-    """adapters/inbound/call_context_builder.py relies on `state['headers']`
-    being populated by the superclass — a custom context builder can read
-    them from there."""
+    """app.py uses this native builder directly (no a2a_utility wrapper
+    around it) — anyone composing their own app who wants request headers
+    can read them from `state['headers']`."""
     source = inspect.getsource(DefaultServerCallContextBuilder.build)
     assert "state['headers']" in source or 'state["headers"]' in source

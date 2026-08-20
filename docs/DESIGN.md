@@ -21,7 +21,7 @@
 |---|---|
 | `ExtendedRequestContext.message` 回傳原生 `Message` | 回傳 `ExtendedMessage` |
 | `.current_task` 回傳原生 `Task` | 回傳 `ExtendedTask` |
-| `.native` 公開原生 `RequestContext` | 改成 `_native`，僅供 library 內部 |
+| `.native` 公開原生 `RequestContext` | 拿掉了（連 `_native` 都刪了——沒有任何呼叫者，見第二節） |
 | `update_status(state)` 吃原生 `TaskState`（整數 enum） | 吃 `ExtendedTaskState`（str enum） |
 | 八個狀態捷徑的 `message=` 只吃原生 `Message` | 吃 str / part / parts / `ExtendedMessage` |
 | `new_agent_message()` 回傳原生 `Message` | 回傳 `ExtendedMessage` |
@@ -29,8 +29,8 @@
 | `server/__init__` re-export `RequestContext`/`EventQueue` | 移除（等於在告訴使用者這些可以用） |
 | `main.py` 自己 `from a2a.types import AgentSkill` | 移除 —— 這支是別人會照抄的範本 |
 
-`server/__init__.py` 現在只 re-export 兩個原生型別：`IDGenerator` 和 `ServerCallContextBuilder`。理由是
-使用者要「指名」它們才能傳 `message_id_generator=` 或子類化 `context_builder=`。其餘一律不 re-export。
+`server/__init__.py` 現在只 re-export 一個原生型別：`IDGenerator`。理由是使用者要「指名」它才能傳
+`message_id_generator=`。其餘一律不 re-export。
 
 驗證方式（`README` 的測試段也有）：
 
@@ -40,65 +40,105 @@ grep -rn "^from a2a\.\|^import a2a\b" ../weather_agent ../calculate_agent ...   
 
 ---
 
-## 二、`ExtendedTaskUpdater` 為什麼每個方法都 override
+## 二、從 imperative 換成 declarative：`DomainAgentExecutorPort`
 
-一度只 override `add_artifact` / `new_agent_message` / `update_status` 三個，其餘八個狀態捷徑
-（`complete`/`failed`/…）完全繼承原生。那個版本很漂亮：「八個方法是原生自己的實作，一行沒改，靠 Python
-動態 dispatch 讓 `update_status` 的 hook 對它們也生效」。
+舊版：domain agent 寫一個 `async def handle(context, event_queue) -> None`，自己建
+`ExtendedTaskUpdater(context, event_queue)`，呼叫哪個方法決定 task 怎麼結束——完全鏡射原生
+`AgentExecutor.execute(context, event_queue) -> None` 的形狀，連 `start_work()` 都要自己送。
 
-**但它讓型別洩漏從後門走回來**：原生 `complete(message: Message)` 吃的是 protobuf。繼承等於對使用者說
-「想在完成時附一句話？自己去 import `a2a.types.Message` 建一個」。
+現在：domain agent 繼承 `DomainAgentExecutorPort`，`execute(self, context: ExtendedRequestContext)`
+是一個 async generator——yield `domain/models/task_events.py` 的 `TaskEvent`（`Progress`／
+`PublishArtifact`／`InputRequired`／`AuthRequired`／`Rejected`／`MessageReply`）驅動 task，`return`
+就是 COMPLETED，`raise` 就是 FAILED。`cancel()` 是可選 override，回傳值是要附在 CANCELED 上的自訂
+訊息（不是決定要不要取消——task 一律會被標成 CANCELED）。
 
-所以現在八個全部顯式 override。犧牲了那個漂亮的性質，換到的是 `message=` 可以吃 `str`。**目標優先於
-形式**。
+這是**刻意違反**第一節以外的另一條既有原則：`AgentHandlerPort`/`OnCancelPort`（現已刪除）的 docstring
+主張「plain Callable，不強迫繼承」。這次改成 class-based 是使用者明確要的用法，理由是宣告式的介面
+需要一個地方掛 `cancel()` 的預設實作，而且比起「鏡射原生」，這次的優先順序是「domain agent 連 task
+生命週期的概念都不用懂」——不只型別被封住，連「什麼時候該呼叫哪個方法」這個知識都不用學。
 
-`update_status` 的 override 另外承擔了 `_ensure_task()`：協定要求 `Task` 事件必須先於任何
-`TaskStatusUpdateEvent`／`TaskArtifactUpdateEvent`，否則 `EventConsumer._handle_task_modification_event`
-會丟 `InvalidAgentResponseError`。因為八個捷徑內部都走 `self.update_status(...)`，動態 dispatch 會進到
-我們的 override，所以 lazy enqueue 對它們全部生效。
-
-`_task_enqueued = True` 是在 `await` **之前**設的 —— 兩個並行的狀態更新否則會都看到 `False`、都送一次
-`Task`，而原生會 log error 並丟掉第二個。
+`adapters/inbound/agent_executor.py` 是唯一讀懂這些 yield 的地方，讀到的每個 `TaskEvent` 對應哪個
+task 狀態、什麼時候該 lazy 建 Task，見第三節。
 
 ---
 
-## 三、`ExtendedEventQueue` 的兩個方法
+## 三、Base executor 內部直接用原生，不繼續用 `ExtendedTaskUpdater`/`ExtendedEventQueue`
 
-原生 `EventQueue` 在 1.1.0 變成 ABC，docstring 寫得很直白：
+`ExtendedTaskUpdater`（原生 `TaskUpdater` 真子類別）和 `ExtendedEventQueue`（原生 `EventQueue` 的薄
+wrapper）曾經存在，被這次改動整個刪除。這裡記錄決策過程，因為中間繞了一圈。
 
-> Producer-side interface passed to `AgentExecutor.execute`/`cancel`. Exposes only `enqueue_event`.
-> The consumer is framework-managed and not part of the public surface.
+### 一開始傾向繼續借用
 
-舊版 wrapper 為了「完整 1:1 對等」把 `dequeue_event`/`tap`/`close`/`task_done`/`is_closed` 全部轉出去。
-那些方法在具體實作（`EventQueueSource`/`EventQueueSink`）上有，但不在框架交給 executor 的**介面**上 ——
-而且交給 domain agent 是有害的：handler 呼叫 `close()` 會直接拆掉框架還在消費的 stream，
-`dequeue_event()` 會把事件從框架自己的 consumer 手上偷走。
+`DomainAgentExecutorPort` 這個設計本身參考了同事 mentor 的一份 pseudo code 範例（`BaseA2AWrapperExecutor`
++ `DomainAgentExecutorPort`，domain agent yield `TextChunk`/`StatusMessage`/`ArtifactResult`/...）。
+那份範例的 base executor 直接呼叫原生 `TaskUpdater`：
 
-**跟介面對等才是對等，跟實作細節對等是坑。**
+```python
+updater = TaskUpdater(event_queue=event_queue, task_id=task_id, context_id=context_id)
+await updater.submit()
+await updater.start_work()
+```
 
-### task_id 驗證只在 event 真的帶了 id 時做
+**這樣寫在真正的 a2a-sdk 1.1.2 下會炸**：讀過原生 `TaskUpdater.update_status()` 原始碼確認，它不會
+自動先送一個 `Task` 事件；而 `EventConsumer._handle_task_modification_event` 要求任何
+`TaskStatusUpdateEvent`/`TaskArtifactUpdateEvent` 之前**必須**先有 `Task` 事件，否則丟
+`InvalidAgentResponseError`。這正是舊版 `ExtendedTaskUpdater._ensure_task()` 存在的理由（`tests/e2e/
+test_agent_server.py::test_task_is_enqueued_before_the_first_event` 釘住這件事）。
 
-`TaskManager.save_task_event()` 會拒絕 task_id 對不上的事件，而且是在框架自己的事件處理路徑上丟，
-不在 handler 的 coroutine 裡 —— 所以 `AgentExecutor` 接不到，會變成很難看的崩潰。`enqueue_event` 提前
-在 handler 自己的 coroutine 裡檢查，丟一個接得到的 `ValueError`。
+一開始因此主張：既然這段邏輯已經寫對、有測試守著，base executor 應該繼續借用
+`ExtendedTaskUpdater`/`ExtendedEventQueue`，不要冒重新踩坑的風險。
 
-但**不能對沒帶 task_id 的事件檢查**：native message-mode 的獨立 `Message` 回覆本來就不帶 task_id
-（proto3 預設 `""`），框架的 `_handle_message_event` 照收。舊版對它一視同仁地驗證，等於擋掉了它 docstring
-自稱支援的那個 workflow。
+### 但這是 mentor 沒寫對，不是原生辦不到
 
-### `enqueue_message` 為什麼要獨立出來
+追問之後發現：上面列的每一個顧慮（Task 先行、cancel 在 Task 建立前就進來的邊界案例、`MessageLike`
+轉換）都只是「自己寫一份會正確運作的邏輯」，沒有一個是原生 `TaskUpdater`/`EventQueue` 結構上做不到的。
+而且既然這次是**完全取代**（不是新舊並存），`ExtendedTaskUpdater`/`ExtendedEventQueue` 在新設計下會
+變成**沒有呼叫者的孤兒程式碼**——唯一用過它們的 `agent_executor.py` 這次要整支改寫，DISCOVERY 模式的
+`DiscoveryAgentExecutor` 也用到它們，一起要動。留著等於維護兩份「怎麼跟原生 Task 生命週期打交道」的
+邏輯，一份在已經沒人呼叫的 `ExtendedTaskUpdater`，一份在新的 `agent_executor.py`。
 
-`enqueue_event(event: Event)` 的 `Event` 是原生的 `Union[Message, Task, TaskStatusUpdateEvent,
-TaskArtifactUpdateEvent]`。這是本次改造一度漏掉的型別洩漏：唯一會直接呼叫 `enqueue_event` 的情境是
-message-mode（`ExtendedTaskUpdater` 結構上做不到），但要送出去就得先把 `ExtendedMessage` 呼叫
-`.to_protobuf()` 轉成原生型別再傳進去 —— handler 沒 import `a2a`，但手上握著一個原生型別的物件、傳給一個
-宣告吃原生型別的方法，跟「domain agent never touches a2a.*」的目標矛盾。
+**最終決定：整個刪除，Task-lifecycle 邏輯收進 `adapters/inbound/_native_task.py`**（private，不對外
+匯出），AGENT 模式的 `agent_executor.py` 跟 DISCOVERY 模式的 `discovery_agent_executor.py` 共用：
 
-修法是新增 `enqueue_message(message: ExtendedMessage) -> None`，內部做 `.to_protobuf()` 再呼叫
-`enqueue_event`（沿用同一套 task_id 驗證邏輯，不重複一份）。`enqueue_event` 保留下來，但重新定位成
-**進階 escape hatch**：真的手上已經有一個原生 `Task`/`TaskStatusUpdateEvent`/`TaskArtifactUpdateEvent`
-物件時才用（`ExtendedTaskUpdater` 內部自己就是這樣用它的），一般 handler 應該只碰得到
-`enqueue_message`。
+- `initial_task(context, task_id, context_id) -> Task`：三分支——`current_task`（續傳）優先、
+  否則從 `message` 建、都沒有就手動兜一個最小 `Task`（cancel 在 Task 送出前就進來的邊界案例，原生
+  沒處理過會在深處炸 `AttributeError`）。
+- `coerce_message(message, ...) -> Optional[Message]`：`MessageLike` → 原生 `Message`。實測發現原生
+  `TaskUpdater.new_agent_message()` 已經處理掉訊息 id 生成，這段比原本以為的還簡單。
+
+好處：全 codebase 只剩一份這個邏輯，`AgentExecutor`（AGENT 模式）跟 `DiscoveryAgentExecutor`
+（DISCOVERY 模式）共用同一個 `_native_task.py`，不是各自維護一份。
+
+### `MessageReply` 為什麼能讓 Task 完全不被建立
+
+`agent_executor.py` 裡 Task 是**惰性建立**的——`ensure_task()` 只在真的需要送 status/artifact 事件時
+才呼叫，不是在 `execute()` 一進來就無條件送。這是 message-mode 之所以能在新設計下繼續運作的關鍵：
+mentor 範例的 `submit()+start_work()` 無條件搶在最前面，等於 Task 一定會被建立，message-mode（獨立
+回一則 `Message`、完全不建 Task）在那個結構下根本做不到——這是這次設計特別要保留、mentor 版本做不到
+的能力，`tests/e2e/test_agent_server.py::test_message_mode_reply_reaches_the_caller` 驗證的就是這個。
+
+### 例外處理跟 cancel 的兩個刻意選擇
+
+- **保留真實錯誤訊息，不採用「通用訊息」**：mentor 範例的 except 區塊把例外吞成固定字串
+  `"Internal server error"`，理由可能是不想讓內部例外洩漏給呼叫端。這次沒有採用——第四節記錄的
+  「安全網存在的唯一理由是保留診斷用的錯誤訊息」這個決策沒有變，`agent_executor.py` 一樣送
+  `f"Agent error: {e}"`。
+- **`cancel()` 回傳值只決定訊息，不決定要不要取消**：mentor 版本 `await self._domain_executor.cancel
+  (domain_ctx)` 之後無條件 `await updater.cancel()`，domain 端的 `cancel()` 完全不能影響最終狀態，
+  只能做旁路的清理。`DomainAgentExecutorPort.cancel()` 保留同樣的「一律 CANCELED」語意，但讓回傳值
+  變成可以附加的自訂訊息——這是舊版 `OnCancelPort`（可以自己建 updater、自訂整個結果）留下來的能力
+  子集，比 mentor 版本多一點、比舊版 `OnCancelPort` 少一點（domain 不再能決定不同的終態，只能加一句
+  話），這是刻意的簡化：外部 cancel RPC 的結局本來就該是 CANCELED，不該由 domain agent 決定成別的
+  狀態。
+
+### 同一輪清掉的另一個孤兒：`A2AUtilityCallContextBuilder`
+
+`adapters/inbound/call_context_builder.py` 曾經是原生 `DefaultServerCallContextBuilder` 的一個空子
+類別——`build()` 什麼都不做，只呼叫 `super().build(request)`。它存在的理由是「context_builder= 的
+預設值，也是要覆寫時繼承的對象」。但上一輪拿掉 production hooks 時，`create_app()` 的 `context_builder=`
+參數已經被移除，這個類別因此也變成沒有任何注入點在用的孤兒——跟 `ExtendedTaskUpdater`/
+`ExtendedEventQueue` 同一個模式：先被上游的簡化拿掉了唯一的呼叫理由，隔了一輪才發現。已刪除，
+`app.py`／自組 app 的 escape hatch 現在直接用原生 `DefaultServerCallContextBuilder`。
 
 ---
 
@@ -174,12 +214,16 @@ e2e：Task 必須先於 status 事件、`aclose()` 沒接、message-mode 壞掉�
 adapters/  →  application/  →  domain/
 ```
 
-- `domain/` 不 import 任何框架 —— `domain/models/agent_card.py` 的 `AgentDescriptor` 是純 dataclass，
-  不碰 a2a-sdk 或 Starlette。
+- `domain/` 不 import 任何框架 —— `domain/models/agent_card.py` 的 `AgentDescriptor`、
+  `domain/models/task_events.py` 的 `TaskEvent` 系列都是純 dataclass，不碰 a2a-sdk 或 Starlette
+  （`TaskEvent` 依賴 `schema` 的 `ExtendedPart`/`MessageLike`，但 `schema` 本身也零框架依賴，不算
+  破例）。
 - `app.py`／`main.py` 是 composition root，唯一允許把所有層兜起來的地方。
 
-`AgentHandlerPort` 的第二個參數型別是 `ExtendedEventQueue`（adapters 層）—— 這是唯一一個刻意的例外，
-因為這個 port 的重點就是把那個具體物件交給 domain agent。
+**舊版有一個刻意的例外，這次拿掉了**：`AgentHandlerPort`（已刪除）的第二個參數型別是
+`ExtendedEventQueue`（adapters 層），domain agent 因此直接依賴 adapters 層的具體型別。新的
+`DomainAgentExecutorPort.execute(self, context: ExtendedRequestContext)` 只有一個參數，型別是
+`ExtendedRequestContext`（application 層），完全不觸碰 adapters 層——分層規則現在沒有例外。
 
 ---
 

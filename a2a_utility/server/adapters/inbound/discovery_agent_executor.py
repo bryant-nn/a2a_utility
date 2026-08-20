@@ -4,37 +4,43 @@ Zero LLM. Interprets the incoming task text as a discovery query ("who can do
 X?"), asks the DiscoveryUseCase, and returns the matching agents as a JSON
 artifact. An empty query returns the full list.
 
-Drives the task through `ExtendedTaskUpdater`/`ExtendedPart`, the same
-vocabulary a domain agent's handler uses — a registry node is an A2A agent
-like any other, so it has no reason to reach for the native `TaskUpdater`
-directly.
+Drives a native `TaskUpdater`/`EventQueue` directly, sharing `_native_task.
+py`'s `initial_task()` with `agent_executor.py` (AGENT mode) — both adapters
+need the same "build the Task that must precede any status event" logic, and
+this keeps it in one place rather than two. DISCOVERY's own flow is strictly
+linear (always produces content, never pauses or replies message-mode), so
+unlike AGENT mode there's no lazy/conditional Task creation here — it's
+always sent up front.
 """
 
+import contextlib
 import json
+import uuid
 
+from a2a.helpers import new_text_part
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
+from a2a.server.tasks import TaskUpdater
+from a2a.types import Task
 
-from ....schema import ExtendedPart
-from ...application.dtos import ExtendedRequestContext
 from ...application.ports.inbound.discovery_use_case_port import DiscoveryUseCasePort
-from ..outbound.event_queue_adapter import ExtendedEventQueue
-from ..outbound.task_updater_adapter import ExtendedTaskUpdater
+from ._native_task import initial_task
 
 
 class DiscoveryAgentExecutor(AgentExecutor):
     def __init__(self, discovery_use_case: DiscoveryUseCasePort) -> None:
         self._discovery_use_case = discovery_use_case
 
-    def _task_updater(self, context: RequestContext, event_queue: EventQueue) -> ExtendedTaskUpdater:
-        return ExtendedTaskUpdater(
-            ExtendedRequestContext(context),
-            ExtendedEventQueue(event_queue, expected_task_id=context.task_id),
-        )
+    def _build(self, context: RequestContext, event_queue: EventQueue) -> tuple[TaskUpdater, Task]:
+        task_id = context.task_id or str(uuid.uuid4())
+        context_id = context.context_id or str(uuid.uuid4())
+        task = initial_task(context, task_id, context_id)
+        return TaskUpdater(event_queue, task.id, task.context_id), task
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
-        task_updater = self._task_updater(context, event_queue)
-        await task_updater.start_work()
+        updater, task = self._build(context, event_queue)
+        await event_queue.enqueue_event(task)
+        await updater.start_work()
 
         query = context.get_user_input()
         try:
@@ -43,14 +49,12 @@ class DiscoveryAgentExecutor(AgentExecutor):
             else:
                 agents = await self._discovery_use_case.list_all()
         except Exception as e:
-            await task_updater.failed(f"Discovery error: {e}")
+            await updater.failed(updater.new_agent_message([new_text_part(f"Discovery error: {e}")]))
             return
 
         result = json.dumps({"agents": [a.to_dict() for a in agents]}, ensure_ascii=False)
-        await task_updater.add_artifact(
-            [ExtendedPart.from_text(result, media_type="application/json")]
-        )
-        await task_updater.complete()
+        await updater.add_artifact([new_text_part(result, media_type="application/json")])
+        await updater.complete()
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         """Acknowledges an externally-requested cancellation.
@@ -61,4 +65,7 @@ class DiscoveryAgentExecutor(AgentExecutor):
         `ActiveTask._run_producer` and turns the task FAILED — a worse
         outcome than simply honoring the cancel.
         """
-        await self._task_updater(context, event_queue).cancel()
+        updater, task = self._build(context, event_queue)
+        with contextlib.suppress(RuntimeError):
+            await event_queue.enqueue_event(task)
+            await updater.cancel()

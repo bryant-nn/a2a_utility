@@ -1,9 +1,9 @@
 """ExtendedTask — the read model for a task the server already knows about.
 
-This is what `ExtendedRequestContext.current_task` hands a handler: the task
-as it stands *right now*, before this execute() call has done anything. It is
-deliberately read-only — a handler changes a task by calling methods on its
-`ExtendedTaskUpdater`, never by mutating a task object.
+This is what `ExtendedRequestContext.current_task` hands a domain agent: the
+task as it stands *right now*, before this execute() call has yielded
+anything. It is deliberately read-only — a domain agent changes a task by
+yielding `TaskEvent`s, never by mutating a task object.
 
 Its main use is resumption. After `requires_input()`/`requires_auth()`, the
 framework re-invokes the agent with a **new** execute() call carrying the same

@@ -29,15 +29,15 @@ from harness import build_card
 
 @pytest.fixture
 def make_app() -> Callable[..., Starlette]:
-    """Builds an app around a handler, with the card and rpc_url the rest of
-    the harness assumes."""
+    """Builds an app around a DomainAgentExecutorPort instance, with the card
+    and rpc_url the rest of the harness assumes."""
 
     def _make(
-        handler=None, *, card: Optional[ExtendedAgentCard] = None, **kwargs
+        executor=None, *, card: Optional[ExtendedAgentCard] = None, **kwargs
     ) -> Starlette:
         return create_app(
             agent_card=card or build_card(),
-            handler=handler,
+            executor=executor,
             rpc_url="/",
             **kwargs,
         )

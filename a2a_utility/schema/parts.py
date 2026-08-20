@@ -207,14 +207,16 @@ class ExtendedPart(BaseModel):
 # Streaming callback contract                                                 #
 # --------------------------------------------------------------------------- #
 PartEmitter = Callable[["ExtendedPart"], Awaitable[None]]
-"""Streams one ExtendedPart live. Shared by server-side handlers (AgentHandlerPort's
-second argument) and the client's call_agent_result(..., emit=...)."""
+"""Streams one ExtendedPart live. The client side's streaming contract —
+`call_agent_result(..., emit=...)` / `ExtendedAgentClient.send(..., emit=...)`
+call this once per part as it arrives."""
 
 
 def as_thinking_emitter(emit: PartEmitter) -> Callable[[str], Awaitable[None]]:
     """Adapts a PartEmitter into a plain str->None callback for business logic
     that only ever streams thinking text (nanobot's on_progress=, deepagents'
-    emit_thought closures, etc.) and doesn't need the richer ExtendedPart shape."""
+    emit_thought closures, etc.) and doesn't need the richer ExtendedPart shape.
+    Client-side use: wrap the `emit=` callback passed to a call_agent* function."""
 
     async def emit_text(text: str) -> None:
         await emit(ExtendedPart.thinking(text))
@@ -270,14 +272,14 @@ class ExtendedMessage(BaseModel):
     """A message on the A2A wire — the incoming user turn, or an agent reply.
 
     Converts both ways. `to_protobuf()` exists so this type can be an *input*
-    as well as a read model: `ExtendedTaskUpdater.complete(message=...)` and
-    friends take one of these, and message-mode replies are published as one.
-    Without it a handler wanting to attach a message to a status update would
-    have to build a native `a2a.types.Message` by hand.
+    as well as a read model: `TaskEvent`'s `message=` fields (`MessageLike`)
+    accept one of these, and `MessageReply` publishes one directly as a
+    message-mode reply. Without it a domain agent wanting to attach a message
+    would have to build a native `a2a.types.Message` by hand.
 
     `message_id` is optional here and generated at the boundary when absent —
-    `ExtendedTaskUpdater.new_agent_message()` fills it from the updater's own
-    ID generator, so a handler never has to invent one.
+    `adapters/inbound/_native_task.py`'s `coerce_message()` fills it in, so a
+    domain agent never has to invent one.
     """
 
     role: MessageRole = MessageRole.AGENT
@@ -320,3 +322,10 @@ class ExtendedMessage(BaseModel):
     def text(self, delimiter: str = "\n") -> str:
         """The concatenated text parts — the plain-language content."""
         return delimiter.join(p.text for p in self.parts if p.text is not None)
+
+
+MessageLike = Union[ExtendedMessage, list[ExtendedPart], ExtendedPart, str]
+"""What server-side code accepts wherever a message is optional convenience
+rather than a strict `ExtendedMessage`. A bare `str` becomes a single text
+part, a part or list of parts becomes an agent message, and an
+`ExtendedMessage` is used as given (with ids filled in if absent)."""
