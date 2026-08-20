@@ -155,6 +155,19 @@ yield StatusMessage(
 # Or use custom types (schema must be registered first)
 ```
 
+## File Parts
+
+`ExtendedPart`'s content is one of `text` / `raw` (bytes) / `url` / `data` — exactly one,
+enforced at construction. `metadata` / `filename` / `media_type` may accompany any of them:
+
+```python
+yield ArtifactResult(parts=[
+    ExtendedPart(url="https://example.com/report.pdf", filename="report.pdf",
+                 media_type="application/pdf"),
+    ExtendedPart(raw=image_bytes, filename="chart.png", media_type="image/png"),
+])
+```
+
 ## Architecture Overview
 
 ```
@@ -287,5 +300,4 @@ only):
 - A discovery node (`a2a_utility.server`'s `ServerMode.DISCOVERY` equivalent)
 - Message-mode (a standalone reply with no `Task` ever created) — `a2a_utility` found
   this useful; this package's event vocabulary doesn't have an equivalent yet
-- File parts (`raw`/`url`/`filename`) — `ExtendedPart` here only supports `text`/`data`
 - Packaging (`pyproject.toml`) so this can be `pip install`ed on its own

@@ -6,9 +6,12 @@ import logging
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, model_validator
+
+if TYPE_CHECKING:
+    from a2a.types import Part
 
 
 logger = logging.getLogger(__name__)
@@ -47,73 +50,132 @@ class CustomizedData(BaseModel):
 
 
 class ExtendedPart(BaseModel):
-    """Domain-layer Part, fully decoupled from protobuf."""
+    """Domain-layer Part, fully decoupled from protobuf.
 
+    Content fields (mutually exclusive — mirrors protobuf oneof 'content'):
+      - text, raw, url, data
+
+    Common fields (may coexist with any content field):
+      - metadata, filename, media_type
+    """
+
+    # oneof content
     text: str | None = None
+    raw: bytes | None = None
+    url: str | None = None
     data: CustomizedData | None = None
 
+    # common fields
+    metadata: dict[str, Any] | None = None
+    filename: str | None = None
+    media_type: str | None = None
+
     @model_validator(mode='after')
-    def exactly_one_field(self) -> ExtendedPart:
+    def exactly_one_content(self) -> ExtendedPart:
         # Mirrors native Part's oneof "content": protobuf silently keeps
-        # whichever of text/data was assigned last instead of raising.
-        if self.text is None and self.data is None:
-            raise ValueError('ExtendedPart must have at least text or data')
-        if self.text is not None and self.data is not None:
-            raise ValueError('ExtendedPart may not set both text and data')
+        # whichever field was assigned last instead of raising.
+        count = sum(v is not None for v in (self.text, self.raw, self.url, self.data))
+        if count != 1:
+            raise ValueError(
+                f'Exactly one content field required (text/raw/url/data), got {count}'
+            )
         return self
 
-    def to_protobuf(self):
+    def to_protobuf(self) -> Part:
         """Convert to a native `a2a.types.Part`.
 
+        Built via the SDK's own `a2a.helpers` constructors, not hand-rolled
+        protobuf plumbing — `data`/`metadata`'s underlying protobuf types
+        (`Value` vs `Struct`, respectively) are the helpers' problem, not
+        this method's.
+
         Returns:
-            A native Part with `text` or `data` set.
+            A native Part with exactly one content field set, plus any
+            common fields given.
         """
-        from a2a.types import Part
-        from google.protobuf.struct_pb2 import Struct, Value
+        from a2a.helpers import new_data_part, new_raw_part, new_text_part, new_url_part
 
         if self.text is not None:
-            return Part(text=self.text)
+            part = new_text_part(self.text, media_type=self.media_type)
+        elif self.raw is not None:
+            part = new_raw_part(self.raw, media_type=self.media_type, filename=self.filename)
+        elif self.url is not None:
+            part = new_url_part(self.url, media_type=self.media_type, filename=self.filename)
+        elif self.data is not None:
+            part = new_data_part(self.data.model_dump(mode='json'), media_type=self.media_type)
+        else:
+            raise ValueError('Unreachable: validated in model_validator')
 
-        if self.data is not None:
-            struct = Struct()
-            struct.update(self.data.model_dump())
-            return Part(data=Value(struct_value=struct))
-
-        raise ValueError('Unreachable: validated in model_validator')
+        # new_raw_part/new_url_part already set filename; new_text_part/
+        # new_data_part don't take one, so backfill without overwriting.
+        if self.filename is not None and not part.filename:
+            part.filename = self.filename
+        if self.metadata:
+            part.metadata.update(self.metadata)
+        return part
 
     @classmethod
-    def from_protobuf(cls, part) -> ExtendedPart:
+    def from_protobuf(cls, part: Part) -> ExtendedPart:
         """Parse a native `a2a.types.Part`. Never raises.
 
         Args:
             part: a native Part.
 
         Returns:
-            The parsed ExtendedPart, or a text fallback (JSON-dumped, or
-            empty) if `part` holds unrecognized or no content.
+            The parsed ExtendedPart. Unrecognized `data` falls back to a
+            JSON-dumped `text`; a Part with no oneof member set at all
+            falls back to empty `text`.
         """
         from google.protobuf.json_format import MessageToDict
 
-        if part.HasField('text'):
-            return cls(text=part.text)
+        # common fields
+        kwargs: dict[str, Any] = {}
+        if part.HasField('metadata'):
+            kwargs['metadata'] = MessageToDict(part.metadata)
+        if part.filename:
+            kwargs['filename'] = part.filename
+        if part.media_type:
+            kwargs['media_type'] = part.media_type
 
-        if part.HasField('data'):
-            raw = MessageToDict(part.data)
-            if isinstance(raw, dict) and 'data_type' in raw and 'data_content' in raw:
-                try:
-                    return cls(data=CustomizedData.model_validate(raw))
-                except Exception as e:
-                    logger.warning('CustomizedData validation failed: %s', e)
+        # oneof content
+        match part.WhichOneof('content'):
+            case 'text':
+                kwargs['text'] = part.text
+            case 'raw':
+                kwargs['raw'] = part.raw
+            case 'url':
+                kwargs['url'] = part.url
+            case 'data':
+                raw = MessageToDict(part.data)
+                if isinstance(raw, dict) and 'data_type' in raw and 'data_content' in raw:
+                    try:
+                        kwargs['data'] = CustomizedData.model_validate(raw)
+                        return cls(**kwargs)
+                    except Exception as e:
+                        logger.warning('CustomizedData validation failed: %s', e)
+                # Fallback: dump unrecognized data as JSON text
+                kwargs['text'] = json.dumps(raw, ensure_ascii=False)
+            case _:
+                logger.warning('Empty Part received, defaulting to empty text')
+                kwargs['text'] = ''
 
-            # Fallback: dump unrecognized data as JSON text
-            return cls(text=json.dumps(raw, ensure_ascii=False))
-
-        logger.warning('Empty Part received, defaulting to empty text')
-        return cls(text='')
+        return cls(**kwargs)
 
 
 @dataclass
 class DomainContext:
+    """What a DomainAgentExecutorPort.execute() call receives.
+
+    Attributes:
+        is_resuming: True when this is a fresh execute() call resuming a
+            task previously paused via InputRequired/AuthRequired (same
+            task_id, not the same coroutine). Read `prior_parts` to pick
+            up where it left off.
+        prior_parts: what the task's paused status said (the
+            InputRequired/AuthRequired prompt). Only meaningful when
+            is_resuming is True; empty otherwise.
+    """
+
     task_id: str
     context_id: str
     parts: list[ExtendedPart]
@@ -122,12 +184,7 @@ class DomainContext:
     configuration: dict[str, Any] = field(default_factory=dict)
     requested_extensions: list[str] = field(default_factory=list)
     is_resuming: bool = False
-    """True when this is a fresh execute() call resuming a task previously
-    paused via InputRequired/AuthRequired (same task_id, not the same
-    coroutine). Read `prior_parts` to pick up where it left off."""
     prior_parts: list[ExtendedPart] = field(default_factory=list)
-    """What the task's paused status said (the InputRequired/AuthRequired
-    prompt). Only meaningful when is_resuming is True; empty otherwise."""
 
     def get_text(self) -> str:
         """Concatenate all text parts.
