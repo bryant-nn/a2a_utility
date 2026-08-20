@@ -72,29 +72,23 @@ class MyChatExecutor(DomainAgentExecutorPort):
 ### 2. Create and Start the Server
 
 ```python
-from a2a.types import AgentCapabilities, AgentCard, AgentInterface, AgentSkill
-
-from a2a_wrapper.server.server_factory import create_a2a_server
+from a2a_wrapper.server import ExtendedAgentCard, ExtendedAgentSkill, create_a2a_server
 
 
-agent_card = AgentCard(
+agent_card = ExtendedAgentCard(
     name="My AI Agent",
     description="An example agent",
-    version="1.0",
-    capabilities=AgentCapabilities(),
-    default_input_modes=["text/plain"],
-    default_output_modes=["text/plain"],
-    skills=[AgentSkill(id="chat", name="Chat", description="General chat", tags=[])],
-    # AgentCard has no plain `url=` field — the interface (and its transport
-    # binding) is declared here instead.
-    supported_interfaces=[AgentInterface(url="https://example.com", protocol_binding="JSONRPC")],
+    port=8000,
+    # host defaults to 127.0.0.1; version/input/output modes/capabilities
+    # are defaulted internally too, all still overridable.
+    skills=[ExtendedAgentSkill(id="chat", name="Chat", description="General chat")],
 )
 
 executor = MyChatExecutor()
 app = create_a2a_server(agent_card, executor)
 
 # Start with uvicorn
-# uvicorn main:app --host 0.0.0.0 --port 8000
+# uvicorn main:app --host {agent_card.host} --port {agent_card.port}
 ```
 
 Run from the repo root — `a2a_wrapper` isn't pip-installed (unlike `a2a_utility`), so a
@@ -103,6 +97,45 @@ script run any other way won't find it on `sys.path`:
 ```bash
 python -m a2a_wrapper.examples.full_featured_agent
 ```
+
+### Try it in a browser
+
+```bash
+python -m a2a_wrapper.examples.full_featured_agent &
+python -m a2a_wrapper.examples.chat_server
+```
+
+Open `http://127.0.0.1:8199`. `chat_server.py` is a thin SSE bridge over `native_client.py`
+(a client built directly on `a2a.client`, no `a2a_utility` dependency) — `index.html` shows
+progress/artifact events live as they stream in, tracks the `task_id` so a paused
+(INPUT_REQUIRED/AUTH_REQUIRED) task resumes on your next message instead of starting a new
+one, and has a Cancel button. Point `A2A_AGENT_URL` at any other a2a_wrapper (or native a2a)
+agent to use it against something else.
+
+### What to test
+
+`full_featured_agent.py` picks a path by keyword — case-insensitive, matched anywhere in
+what you type (not just the browser UI; the same keywords work through
+`call_full_featured_agent.py` or your own script against `native_client.py`):
+
+| Type | What happens | TaskEvent |
+|---|---|---|
+| anything else | one "thinking..." progress bubble, then the final answer, COMPLETED | `TextChunk` + `ArtifactResult` |
+| `stream please` | 3 progress bubbles ~1s apart ("analyzing the request..." → "breaking it down into steps..." → "composing..."), then the answer streamed in across 6 artifact chunks ~0.4s apart | `StatusMessage` × 3, then `ArtifactResult` × 6 (`append`/`last_chunk`) |
+| `input please` | pauses INPUT_REQUIRED, asks "which city?" | `InputRequired` |
+| `auth please` | pauses AUTH_REQUIRED, asks for credentials | `AuthRequired` |
+| `reject me` | ends REJECTED outright | `Rejected` |
+| `fail now` | raises; the real exception text reaches you as the FAILED status message | an exception, not an event |
+
+**Resume**: send `input please` (or `auth please`) — the task pauses waiting on you. In the
+browser UI, just type your reply next (`boston`, say) and hit send — it automatically resends
+the same `task_id`, so the agent sees `context.is_resuming=True` and picks up where it left
+off instead of starting over. Doing this by hand (script/curl) means passing `task_id=` from
+the paused response's `task_id` on your next call.
+
+**Cancel**: pause a task (`input please`), then hit Cancel in the UI (or call
+`native_client.cancel_agent(base_url, task_id)` / `ExtendedAgentClient.cancel_task(task_id)`).
+The agent's `cancel()` override returns a message that lands on the CANCELED status.
 
 ## Event Types
 
@@ -266,16 +299,47 @@ All of the above were verified against a real running server (real ASGI transpor
 native `a2a.client`, not just import-checked) — every event type, the resume round trip,
 reject, fail-with-real-message, and cancel-with-custom-message all confirmed working.
 
+Since then, brought closer to parity with `a2a_utility` on request:
+
+- **`ExtendedAgentCard`/`ExtendedAgentSkill`/`ExtendedAgentProvider` added**
+  (`server/card.py`) — mirrors `a2a_utility/server/card.py` field-for-field, so
+  `create_a2a_server()` and the example never import `a2a.types` directly (the original
+  sketch's example did, to build the card).
+- **`ExtendedPart` expanded from `text`/`data`-only to the full `text`/`raw`/`url`/`data`
+  oneof**, plus `filename`/`media_type`. The "at least one" validator generalized to
+  "exactly one of the four" — deliberately stricter than `a2a_utility`'s own `ExtendedPart`,
+  which allows zero (see below).
+- **`to_protobuf()` rewritten to build the `Part` via `a2a.helpers`'s own
+  `new_text_part`/`new_raw_part`/`new_url_part`/`new_data_part`**, instead of hand-rolled
+  `Part(**kwargs)` with manual `Struct`/`Value` construction — found the hard way that
+  `Part.data` is a `google.protobuf.Value` but `Part.metadata` is a plain `Struct` (two
+  different types); the hand-rolled version shared one conversion helper for both, which
+  crashes for one of them (verified: `Part(metadata=Value(...))` raises `AttributeError`,
+  `Part(data=Struct(...))` raises `TypeError`). Matches `a2a_utility` exactly now,
+  including `part.metadata.update(...)` after construction.
+
+**A known, currently-unresolved difference from `a2a_utility`'s `ExtendedPart`**: on an
+unrecognized `data` payload, `a2a_utility.schema.parts.ExtendedPart.from_protobuf()` has
+no try/except around `CustomizedData(**MessageToDict(...))` and raises `ValidationError`
+straight out (verified); this package's `from_protobuf()` catches that and falls back to
+JSON-dumped `text`, per its own "never raises" docstring. Neither is a bug — they're just
+different resilience postures that happened independently. Not aligned yet.
+
 ## Project Structure
 
 ```
 a2a_wrapper/                      # repo-root sibling of a2a_utility/
-├── types.py            # Domain data type definitions
-├── events.py            # Domain event definitions
+├── types.py            # Domain data type definitions (ExtendedPart, DomainContext, ...)
+├── events.py            # Domain event definitions (StreamEvent and its variants)
 ├── examples/
-│   └── full_featured_agent.py    # runnable, exercises every event type
+│   ├── full_featured_agent.py         # runnable domain agent, exercises every event type
+│   ├── call_full_featured_agent.py    # drives it via a2a_utility.client
+│   ├── native_client.py               # a minimal client on bare a2a.client, no a2a_utility
+│   ├── chat_server.py                 # SSE bridge for index.html, built on native_client.py
+│   └── index.html                     # a small browser chat UI
 ├── server/
 │   ├── base_executor.py  # A2A adapter implementation
+│   ├── card.py            # ExtendedAgentCard/ExtendedAgentSkill/ExtendedAgentProvider
 │   ├── server_factory.py # Server creation factory
 │   └── ports/
 │       └── domain_agent_executor.py  # Port interface

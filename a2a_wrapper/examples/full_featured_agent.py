@@ -7,10 +7,10 @@ a2a_wrapper` resolves; a plain `python a2a_wrapper/examples/...py` will not):
 
     python -m a2a_wrapper.examples.full_featured_agent
 
-Send a message containing one of these words to exercise each path (see
-a2a_utility/examples/ for a client-side driver pattern you can adapt —
-a2a_wrapper doesn't have its own client yet, it only covers the
-server/domain-agent-executor side so far):
+Send a message containing one of these words to exercise each path. To talk
+to it: `call_full_featured_agent.py` (uses a2a_utility.client) or
+`native_client.py` + `chat_server.py` (a minimal native-a2a client and a
+browser UI for it, no a2a_utility dependency) in this same directory.
 
     (default)  -> TextChunk + ArtifactResult, then COMPLETED
     "stream"   -> one artifact streamed across several chunks (append/last_chunk)
@@ -23,6 +23,8 @@ server/domain-agent-executor side so far):
 """
 
 from __future__ import annotations
+
+import asyncio
 
 from a2a_wrapper import (
     ArtifactResult,
@@ -75,15 +77,36 @@ class FullFeaturedAgent(DomainAgentExecutorPort):
             raise ValueError(f"could not handle: {text!r}")
 
         if "stream" in text:
-            yield StatusMessage(parts=[ExtendedPart(text="composing a long answer in pieces...")])
+            # A visible multi-step "thinking" sequence before the answer —
+            # await asyncio.sleep(), not time.sleep(): the latter blocks the
+            # whole event loop (nothing gets flushed to the client, and no
+            # other request can be served either) until it returns, so every
+            # step would arrive in one burst instead of staggered live.
+            thinking_steps = [
+                "analyzing the request...",
+                "breaking it down into steps...",
+                "composing a long answer in pieces...",
+            ]
+            for step in thinking_steps:
+                yield StatusMessage(parts=[ExtendedPart(text=step)])
+                await asyncio.sleep(1)
+
             words = ["This ", "answer ", "arrives ", "in ", "chunks."]
             for i, word in enumerate(words):
                 yield ArtifactResult(
                     parts=[ExtendedPart(text=word)],
                     artifact_id="streamed-answer",
                     append=i > 0,
-                    last_chunk=(i == len(words) - 1),
+                    last_chunk=False,
                 )
+                await asyncio.sleep(0.4)
+
+            yield ArtifactResult(
+                parts=[ExtendedPart(text="done!")],
+                artifact_id="streamed-answer",
+                append=True,
+                last_chunk=True,
+            )
             return
 
         yield TextChunk(text="thinking...")

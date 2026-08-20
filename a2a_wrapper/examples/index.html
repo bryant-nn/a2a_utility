@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>a2a_wrapper chat</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #6b7280; --border: #e5e7eb;
+    --user-bg: #2563eb; --user-fg: #ffffff;
+    --agent-bg: #f3f4f6; --agent-fg: #1a1a1a;
+    --accent: #2563eb; --danger: #dc2626; --warn: #b45309;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111827; --fg: #e5e7eb; --muted: #9ca3af; --border: #374151;
+      --user-bg: #3b82f6; --user-fg: #ffffff;
+      --agent-bg: #1f2937; --agent-fg: #e5e7eb;
+      --accent: #60a5fa; --danger: #f87171; --warn: #fbbf24;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .agent-url { color: var(--muted); font-size: 12px; }
+  header .hints { color: var(--muted); font-size: 12px; margin-left: auto; }
+  #log {
+    flex: 1; overflow-y: auto; padding: 16px; display: flex;
+    flex-direction: column; gap: 10px;
+  }
+  .row { display: flex; }
+  .row.user { justify-content: flex-end; }
+  .bubble {
+    max-width: 70%; padding: 8px 12px; border-radius: 10px; font-size: 14px;
+    line-height: 1.4; white-space: pre-wrap; word-break: break-word;
+  }
+  .row.user .bubble { background: var(--user-bg); color: var(--user-fg); }
+  .row.agent .bubble { background: var(--agent-bg); color: var(--agent-fg); }
+  .row.agent .bubble.progress { color: var(--muted); font-style: italic; }
+  .row.agent .bubble.status {
+    font-size: 12px; color: var(--muted); background: none; padding: 0;
+  }
+  .row.agent .bubble.status.rejected,
+  .row.agent .bubble.status.failed { color: var(--danger); }
+  .row.agent .bubble.status.paused { color: var(--warn); }
+  footer {
+    border-top: 1px solid var(--border); padding: 12px 16px;
+    display: flex; gap: 8px; align-items: center;
+  }
+  #taskBadge {
+    font-size: 11px; color: var(--muted); white-space: nowrap;
+  }
+  #msg {
+    flex: 1; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--fg); font-size: 14px;
+  }
+  button {
+    padding: 8px 14px; border-radius: 8px; border: none; cursor: pointer;
+    font-size: 14px; font-weight: 500;
+  }
+  #send { background: var(--accent); color: white; }
+  #cancel { background: var(--danger); color: white; display: none; }
+  button:disabled { opacity: 0.5; cursor: default; }
+</style>
+</head>
+<body>
+<header>
+  <h1>a2a_wrapper chat</h1>
+  <span class="agent-url" id="agentUrl"></span>
+  <span class="hints">try: stream / input / auth / reject / fail</span>
+</header>
+<div id="log"></div>
+<footer>
+  <span id="taskBadge"></span>
+  <input id="msg" type="text" placeholder="Type a message..." autofocus>
+  <button id="send">Send</button>
+  <button id="cancel">Cancel</button>
+</footer>
+
+<script>
+const log = document.getElementById('log');
+const msgInput = document.getElementById('msg');
+const sendBtn = document.getElementById('send');
+const cancelBtn = document.getElementById('cancel');
+const taskBadge = document.getElementById('taskBadge');
+
+let currentTaskId = null;   // set when paused (INPUT_REQUIRED/AUTH_REQUIRED) -> next send resumes it
+let inFlightTaskId = null;  // set while a request is streaming -> cancel target
+let source = null;
+
+function addRow(role, text, cls) {
+  const row = document.createElement('div');
+  row.className = 'row ' + role;
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble' + (cls ? ' ' + cls : '');
+  bubble.textContent = text;
+  row.appendChild(bubble);
+  log.appendChild(row);
+  log.scrollTop = log.scrollHeight;
+  return bubble;
+}
+
+function updateBadge() {
+  if (inFlightTaskId) {
+    taskBadge.textContent = 'running: ' + inFlightTaskId.slice(0, 8);
+  } else if (currentTaskId) {
+    taskBadge.textContent = 'paused: ' + currentTaskId.slice(0, 8) + ' (next message resumes it)';
+  } else {
+    taskBadge.textContent = '';
+  }
+}
+
+async function send() {
+  const text = msgInput.value.trim();
+  if (!text) return;
+  addRow('user', text);
+  msgInput.value = '';
+  sendBtn.disabled = true;
+
+  const params = new URLSearchParams({ message: text });
+  if (currentTaskId) params.set('task_id', currentTaskId);
+
+  let progressBubble = null;
+  let artifactBubble = null;
+
+  source = new EventSource('/api/chat/stream?' + params.toString());
+  cancelBtn.style.display = 'inline-block';
+
+  source.onmessage = (e) => {
+    const ev = JSON.parse(e.data);
+    if (ev.type === 'progress') {
+      progressBubble = addRow('agent', ev.text, 'progress');
+    } else if (ev.type === 'artifact') {
+      if (!artifactBubble) artifactBubble = addRow('agent', '', null);
+      artifactBubble.textContent += ev.text;
+      log.scrollTop = log.scrollHeight;
+    } else if (ev.type === 'message') {
+      addRow('agent', ev.text);
+    } else if (ev.type === 'done') {
+      inFlightTaskId = ev.task_id;
+      finish(ev);
+    }
+  };
+  source.onerror = () => {
+    source.close();
+    inFlightTaskId = null;
+    sendBtn.disabled = false;
+    cancelBtn.style.display = 'none';
+    addRow('agent', 'connection error', 'status failed');
+    updateBadge();
+  };
+}
+
+function finish(ev) {
+  source.close();
+  inFlightTaskId = null;
+  sendBtn.disabled = false;
+  cancelBtn.style.display = 'none';
+
+  const paused = ev.status === 'TASK_STATE_INPUT_REQUIRED' || ev.status === 'TASK_STATE_AUTH_REQUIRED';
+  currentTaskId = paused ? ev.task_id : null;
+
+  if (paused && ev.status_message) {
+    addRow('agent', ev.status_message, 'status paused');
+  } else if (ev.status === 'TASK_STATE_REJECTED' || ev.status === 'TASK_STATE_FAILED') {
+    addRow('agent', ev.status.replace('TASK_STATE_', '') + ': ' + (ev.status_message || ''), 'status rejected');
+  } else if (ev.status !== 'TASK_STATE_COMPLETED') {
+    addRow('agent', ev.status.replace('TASK_STATE_', ''), 'status');
+  }
+  updateBadge();
+}
+
+async function cancel() {
+  const taskId = inFlightTaskId || currentTaskId;
+  if (!taskId) return;
+  if (source) source.close();
+  const resp = await fetch('/api/cancel', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ task_id: taskId }),
+  });
+  const result = await resp.json();
+  addRow('agent', 'canceled' + (result.status_message ? ': ' + result.status_message : ''), 'status');
+  inFlightTaskId = null;
+  currentTaskId = null;
+  sendBtn.disabled = false;
+  cancelBtn.style.display = 'none';
+  updateBadge();
+}
+
+sendBtn.addEventListener('click', send);
+cancelBtn.addEventListener('click', cancel);
+msgInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
+
+fetch('/api/info').then(r => r.json()).then(info => {
+  document.getElementById('agentUrl').textContent = info.agent_url;
+});
+</script>
+</body>
+</html>
