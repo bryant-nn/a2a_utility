@@ -50,6 +50,9 @@ async def stream_agent(
             is opened and closed for this call only.
 
     Yields:
+        `{"type": "task_id", "task_id": str}` once, as soon as the task id is
+        known — before any progress/artifact events, so a caller can cancel
+        mid-stream instead of only after the exchange finishes;
         `{"type": "progress", "text": str}` for a WORKING status message,
         `{"type": "artifact", "text": str}` for each artifact chunk,
         `{"type": "message", "text": str}` for a message-mode reply, and
@@ -69,6 +72,9 @@ async def stream_agent(
         artifact_text: list[str] = []
         status_message: Optional[str] = None
         message_mode_text: Optional[str] = None
+        task_id_announced = bool(current_task_id)
+        if task_id_announced:
+            yield {"type": "task_id", "task_id": current_task_id}
 
         message = _build_message(text, task_id)
         async for event in client.send_message(SendMessageRequest(message=message)):
@@ -76,6 +82,9 @@ async def stream_agent(
                 task = event.task
                 current_task_id = task.id or current_task_id
                 status = task.status.state
+                if not task_id_announced and current_task_id:
+                    task_id_announced = True
+                    yield {"type": "task_id", "task_id": current_task_id}
                 for artifact in task.artifacts:
                     for part in artifact.parts:
                         if part.text:
@@ -86,6 +95,9 @@ async def stream_agent(
             elif event.HasField("status_update"):
                 update = event.status_update
                 current_task_id = update.task_id or current_task_id
+                if not task_id_announced and current_task_id:
+                    task_id_announced = True
+                    yield {"type": "task_id", "task_id": current_task_id}
                 status = update.status.state
                 if update.status.HasField("message"):
                     parts = update.status.message.parts

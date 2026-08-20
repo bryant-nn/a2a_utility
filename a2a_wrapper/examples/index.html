@@ -135,7 +135,10 @@ async function send() {
 
   source.onmessage = (e) => {
     const ev = JSON.parse(e.data);
-    if (ev.type === 'progress') {
+    if (ev.type === 'task_id') {
+      inFlightTaskId = ev.task_id;
+      updateBadge();
+    } else if (ev.type === 'progress') {
       progressBubble = addRow('agent', ev.text, 'progress');
     } else if (ev.type === 'artifact') {
       if (!artifactBubble) artifactBubble = addRow('agent', '', null);
@@ -144,7 +147,6 @@ async function send() {
     } else if (ev.type === 'message') {
       addRow('agent', ev.text);
     } else if (ev.type === 'done') {
-      inFlightTaskId = ev.task_id;
       finish(ev);
     }
   };
