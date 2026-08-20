@@ -91,6 +91,26 @@ app = create_a2a_server(agent_card, executor)
 # uvicorn main:app --host {agent_card.host} --port {agent_card.port}
 ```
 
+`host`/`port` control only where uvicorn binds. If the agent sits behind a reverse proxy,
+gateway, or NAT — anywhere the externally-reachable address differs from the bind address —
+set `endpoint` on `ExtendedAgentCard` to override what gets advertised instead:
+
+```python
+agent_card = ExtendedAgentCard(
+    name="My AI Agent",
+    description="An example agent",
+    host="0.0.0.0",          # bind address — irrelevant to what clients see
+    port=8000,
+    endpoint="https://gateway.example.com/agents/my-agent",  # what clients actually call
+    skills=[ExtendedAgentSkill(id="chat", name="Chat", description="General chat")],
+)
+```
+
+With `endpoint` set, both `agent_card_url` (where the card itself is served) and the RPC
+interface url inside the served card switch to it — a coordinator resolves the agent purely
+from the card it fetches, so it ends up calling `endpoint`, never the raw `host:port`. Leave
+`endpoint` unset and both default to `http://{host}:{port}` as before.
+
 Run from the repo root — `a2a_wrapper` isn't pip-installed (unlike `a2a_utility`), so a
 script run any other way won't find it on `sys.path`:
 

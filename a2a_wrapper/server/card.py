@@ -103,9 +103,15 @@ class ExtendedAgentCard(BaseModel):
     documentation_url: Optional[str] = None
     icon_url: Optional[str] = None
 
+    # Overrides the advertised base URL (both agent_card_url and the RPC
+    # interface url) when set — e.g. the externally-reachable address behind
+    # a reverse proxy/gateway, which may differ from where the server
+    # actually binds. host/port still control only uvicorn's bind address.
+    endpoint: Optional[str] = None
+
     @property
     def url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        return self.endpoint if self.endpoint else f"http://{self.host}:{self.port}"
 
     @property
     def agent_card_url(self) -> str:
