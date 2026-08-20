@@ -8,9 +8,10 @@ a2a_wrapper` resolves; a plain `python a2a_wrapper/examples/...py` will not):
     python -m a2a_wrapper.examples.full_featured_agent
 
 Send a message containing one of these words to exercise each path. To talk
-to it: `call_full_featured_agent.py` (uses a2a_utility.client) or
+to it, use anything in this directory — none of it needs a2a_utility:
+`call_full_featured_agent.py` (a scripted walk through every path) or
 `native_client.py` + `chat_server.py` (a minimal native-a2a client and a
-browser UI for it, no a2a_utility dependency) in this same directory.
+browser UI for it).
 
     (default)  -> TextChunk + ArtifactResult, then COMPLETED
     "stream"   -> one artifact streamed across several chunks (append/last_chunk)

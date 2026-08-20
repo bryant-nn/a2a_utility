@@ -134,8 +134,8 @@ off instead of starting over. Doing this by hand (script/curl) means passing `ta
 the paused response's `task_id` on your next call.
 
 **Cancel**: pause a task (`input please`), then hit Cancel in the UI (or call
-`native_client.cancel_agent(base_url, task_id)` / `ExtendedAgentClient.cancel_task(task_id)`).
-The agent's `cancel()` override returns a message that lands on the CANCELED status.
+`native_client.cancel_agent(base_url, task_id)` directly). The agent's `cancel()` override
+returns a message that lands on the CANCELED status.
 
 ## Event Types
 
@@ -333,7 +333,7 @@ a2a_wrapper/                      # repo-root sibling of a2a_utility/
 ├── events.py            # Domain event definitions (StreamEvent and its variants)
 ├── examples/
 │   ├── full_featured_agent.py         # runnable domain agent, exercises every event type
-│   ├── call_full_featured_agent.py    # drives it via a2a_utility.client
+│   ├── call_full_featured_agent.py    # scripted walk through every path, via native_client.py
 │   ├── native_client.py               # a minimal client on bare a2a.client, no a2a_utility
 │   ├── chat_server.py                 # SSE bridge for index.html, built on native_client.py
 │   └── index.html                     # a small browser chat UI
